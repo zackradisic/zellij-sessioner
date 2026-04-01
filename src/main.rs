@@ -199,8 +199,14 @@ impl State {
 
         // "New session" item
         if cur >= self.scroll_offset && cur < vis_end {
-            let mut item = NestedListItem::new("New session").color_range(2, ..);
-            if self.selected == NEW_SESSION_IDX {
+            let is_selected = self.selected == NEW_SESSION_IDX;
+            let label = if is_selected {
+                "▸ New session".to_string()
+            } else {
+                "  New session".to_string()
+            };
+            let mut item = NestedListItem::new(&label).color_range(2, ..);
+            if is_selected {
                 item = item.selected();
             }
             items.push(item);
@@ -221,12 +227,14 @@ impl State {
                     ""
                 };
 
-                let header_text = format!("{}{}", session.name, suffix);
-                let name_len = session.name.len();
+                let prefix = if is_selected { "▸ " } else { "  " };
+                let header_text = format!("{}{}{}", prefix, session.name, suffix);
+                let prefix_len = prefix.chars().count();
+                let name_end = prefix_len + session.name.len();
                 let mut item =
-                    NestedListItem::new(&header_text).color_range(0, ..name_len);
+                    NestedListItem::new(&header_text).color_range(0, prefix_len..name_end);
                 if !suffix.is_empty() {
-                    item = item.color_range(2, name_len..header_text.len());
+                    item = item.color_range(2, name_end..header_text.len());
                 }
                 if is_selected {
                     item = item.selected();
@@ -254,11 +262,13 @@ impl State {
             let is_selected = self.selected == entry_idx;
 
             if cur >= self.scroll_offset && cur < vis_end {
-                let header_text = format!("{} (exited)", name);
-                let name_len = name.len();
+                let prefix = if is_selected { "▸ " } else { "  " };
+                let header_text = format!("{}{} (exited)", prefix, name);
+                let prefix_len = prefix.chars().count();
+                let name_end = prefix_len + name.len();
                 let mut item =
-                    NestedListItem::new(&header_text).color_range(0, ..name_len);
-                item = item.color_range(2, name_len..header_text.len());
+                    NestedListItem::new(&header_text).color_range(0, prefix_len..name_end);
+                item = item.color_range(2, name_end..header_text.len());
                 if is_selected {
                     item = item.selected();
                 }
