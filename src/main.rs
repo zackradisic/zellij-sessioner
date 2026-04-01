@@ -97,8 +97,10 @@ impl ZellijPlugin for State {
             return;
         }
 
-        let items = self.build_list_items(body_height);
-        print_nested_list_with_coordinates(items, 0, 1, Some(cols), Some(body_height));
+        let lines = self.build_list_lines(body_height);
+        for (i, text) in lines.into_iter().enumerate() {
+            print_text_with_coordinates(text, 0, 1 + i, Some(cols), Some(1));
+        }
     }
 }
 
@@ -133,11 +135,11 @@ impl State {
         titles
     }
 
-    /// Build the nested list items with scroll support.
-    fn build_list_items(&mut self, visible_rows: usize) -> Vec<NestedListItem> {
+    /// Build text lines for the body with scroll support.
+    fn build_list_lines(&mut self, visible_rows: usize) -> Vec<Text> {
         struct Block {
             header_line: usize,
-            lines: usize, // total lines this block occupies
+            lines: usize,
             entry_idx: usize,
         }
 
@@ -192,7 +194,7 @@ impl State {
             self.scroll_offset = total_lines.saturating_sub(visible_rows);
         }
 
-        // Emit visible NestedListItems
+        // Emit visible Text lines
         let mut items = Vec::new();
         let mut cur = 0usize;
         let vis_end = self.scroll_offset + visible_rows;
@@ -200,12 +202,10 @@ impl State {
         // "New session" item
         if cur >= self.scroll_offset && cur < vis_end {
             let is_selected = self.selected == NEW_SESSION_IDX;
-            let label = if is_selected {
-                "▸ New session".to_string()
-            } else {
-                "  New session".to_string()
-            };
-            let mut item = NestedListItem::new(&label).color_range(2, ..);
+            let prefix = if is_selected { "▸ " } else { "  " };
+            let label = format!("{}New session", prefix);
+            let prefix_chars = prefix.chars().count();
+            let mut item = Text::new(&label).color_range(2, prefix_chars..);
             if is_selected {
                 item = item.selected();
             }
@@ -228,13 +228,12 @@ impl State {
                 };
 
                 let prefix = if is_selected { "▸ " } else { "  " };
-                let header_text = format!("{}{}{}", prefix, session.name, suffix);
-                let prefix_len = prefix.chars().count();
-                let name_end = prefix_len + session.name.len();
-                let mut item =
-                    NestedListItem::new(&header_text).color_range(0, prefix_len..name_end);
+                let text = format!("{}{}{}", prefix, session.name, suffix);
+                let prefix_chars = prefix.chars().count();
+                let name_end = prefix_chars + session.name.len();
+                let mut item = Text::new(&text).color_range(0, prefix_chars..name_end);
                 if !suffix.is_empty() {
-                    item = item.color_range(2, name_end..header_text.len());
+                    item = item.color_range(2, name_end..text.len());
                 }
                 if is_selected {
                     item = item.selected();
@@ -245,8 +244,8 @@ impl State {
 
             for title in &Self::pane_titles(session) {
                 if cur >= self.scroll_offset && cur < vis_end {
-                    let mut item =
-                        NestedListItem::new(title).indent(1).color_range(1, ..);
+                    let line_text = format!("    {}", title);
+                    let mut item = Text::new(&line_text).color_range(1, 4..);
                     if is_selected {
                         item = item.selected();
                     }
@@ -263,12 +262,11 @@ impl State {
 
             if cur >= self.scroll_offset && cur < vis_end {
                 let prefix = if is_selected { "▸ " } else { "  " };
-                let header_text = format!("{}{} (exited)", prefix, name);
-                let prefix_len = prefix.chars().count();
-                let name_end = prefix_len + name.len();
-                let mut item =
-                    NestedListItem::new(&header_text).color_range(0, prefix_len..name_end);
-                item = item.color_range(2, name_end..header_text.len());
+                let text = format!("{}{} (exited)", prefix, name);
+                let prefix_chars = prefix.chars().count();
+                let name_end = prefix_chars + name.len();
+                let mut item = Text::new(&text).color_range(0, prefix_chars..name_end);
+                item = item.color_range(2, name_end..text.len());
                 if is_selected {
                     item = item.selected();
                 }
@@ -277,9 +275,8 @@ impl State {
             cur += 1;
 
             if cur >= self.scroll_offset && cur < vis_end {
-                let info = format!("exited {}", format_duration(*age));
-                let mut item =
-                    NestedListItem::new(&info).indent(1).color_range(1, ..);
+                let info = format!("    exited {}", format_duration(*age));
+                let mut item = Text::new(&info).color_range(1, 4..);
                 if is_selected {
                     item = item.selected();
                 }
