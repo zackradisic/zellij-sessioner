@@ -82,7 +82,7 @@ impl ZellijPlugin for State {
                 let frame = SPINNER[self.spinner_idx % SPINNER.len()];
                 self.spinner_idx = self.spinner_idx.wrapping_add(1);
                 let plugin_id = get_plugin_ids().plugin_id;
-                rename_plugin_pane(plugin_id, &format!("Sessioner {}", frame));
+                rename_plugin_pane(plugin_id, format!("Sessioner {}", frame));
                 set_timeout(2.0);
                 changed
             }
