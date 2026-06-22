@@ -35,6 +35,9 @@ impl ZellijPlugin for State {
         match event {
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.permissions_granted = true;
+                // Populate the list immediately rather than waiting for the
+                // first timer tick.
+                self.refresh_sessions();
                 set_timeout(2.0);
                 true
             }
@@ -49,14 +52,17 @@ impl ZellijPlugin for State {
                 true
             }
             Event::Timer(_) => {
-                // Cycle the plugin pane title to trigger a fresh
-                // SessionUpdate with up-to-date pane titles.
+                // zellij only populates the full peer-session list when a
+                // plugin explicitly asks for it via get_session_list(); the
+                // passive SessionUpdate event otherwise only ever contains the
+                // current session. Poll it on a timer to keep the list fresh.
+                let changed = self.refresh_sessions();
                 let frame = SPINNER[self.spinner_idx % SPINNER.len()];
                 self.spinner_idx = self.spinner_idx.wrapping_add(1);
                 let plugin_id = get_plugin_ids().plugin_id;
                 rename_plugin_pane(plugin_id, &format!("Sessioner {}", frame));
                 set_timeout(2.0);
-                false
+                changed
             }
             Event::Key(key) => self.handle_key(key),
             _ => false,
@@ -108,6 +114,23 @@ impl State {
     /// Total entries: 1 ("New session") + live sessions + dead sessions.
     fn entry_count(&self) -> usize {
         1 + self.sessions.len() + self.resurrectable.len()
+    }
+
+    /// Pull the full session list from zellij. This is the only way to learn
+    /// about peer sessions: the server only fills its peer-session cache in
+    /// response to this call, so a plugin that merely subscribes to
+    /// `SessionUpdate` sees nothing but its own session. Returns whether the
+    /// list was refreshed (i.e. the plugin should re-render).
+    fn refresh_sessions(&mut self) -> bool {
+        match get_session_list() {
+            Ok(snapshot) => {
+                self.sessions = snapshot.live_sessions;
+                self.resurrectable = snapshot.resurrectable_sessions;
+                self.clamp_selection();
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     fn clamp_selection(&mut self) {
@@ -320,7 +343,7 @@ impl State {
         }
 
         if key.is_key_without_modifier(BareKey::Char('D')) {
-            delete_all_dead_sessions();
+            let _ = delete_all_dead_sessions();
             return true;
         }
 
@@ -364,7 +387,7 @@ impl State {
         if session_idx >= self.sessions.len() {
             let dead_idx = session_idx - self.sessions.len();
             if let Some((name, _)) = self.resurrectable.get(dead_idx) {
-                delete_dead_session(name);
+                let _ = delete_dead_session(name);
             }
         }
     }
