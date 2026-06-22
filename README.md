@@ -115,10 +115,28 @@ zellij action launch-or-focus-plugin \
 |-----|--------|
 | `↑` / `k` | Move selection up |
 | `↓` / `j` | Move selection down |
+| `/` | Search / filter sessions |
 | `Enter` | Switch to selected session / start new session |
+| `r` | Rename the attached session (other sessions can't be renamed via the plugin API) |
+| `x` | Kill selected live session (asks to confirm; not the attached one) |
 | `d` | Delete selected dead session |
 | `D` | Delete all dead sessions |
 | `Esc` / `q` | Close the plugin |
+
+### Search
+
+Press `/` to filter the list as you type. A session matches if its **name** or
+any of its **pane titles** contains the query (case-insensitive) — so you can
+jump to a session by what's running in it, not just its name. While searching:
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Move selection (within matches) |
+| `Backspace` | Edit the query |
+| `Enter` | Attach to the selected match |
+| `Esc` | Clear the query, then exit search |
+
+Dead sessions match on their name only.
 
 ## How it works
 
