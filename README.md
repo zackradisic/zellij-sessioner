@@ -116,6 +116,7 @@ zellij action launch-or-focus-plugin \
 | `↑` / `k` | Move selection up |
 | `↓` / `j` | Move selection down |
 | `/` | Search / filter sessions |
+| `p` | Toggle a live color preview of the selected session's focused pane |
 | `Enter` | Switch to selected session / start new session |
 | `r` | Rename the attached session (other sessions can't be renamed via the plugin API) |
 | `x` | Kill selected live session (asks to confirm; not the attached one) |
@@ -147,6 +148,23 @@ list with pane manifests. For each session it shows:
 - **Pane titles** indented underneath (plugin panes excluded)
 
 Dead (resurrectable) sessions appear at the bottom with their age.
+
+## Preview
+
+Pressing `p` expands the plugin to full screen width and shows a live, in-color
+preview of the selected session's focused pane beside the list. Since the plugin
+API can only read pane content for its *own* session, the preview shells out (via
+the `RunCommands` permission) to:
+
+```
+ZELLIJ_SESSION_NAME=<session> zellij action dump-screen --pane-id terminal_<id> --ansi
+```
+
+The dump runs asynchronously; its output arrives back as a `RunCommandResult`
+event, is cached per pane, and is re-fetched on the refresh timer to stay
+current. The `--ansi` output is rendered as raw escape codes so terminal colors
+are preserved (the `Text` UI API only supports theme-palette colors). Toggling
+the preview off restores the plugin's original floating-pane size.
 
 ## Pane title freshness
 

@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::time::Duration;
 use zellij_tile::prelude::*;
 
@@ -24,6 +25,16 @@ struct State {
     /// Transient one-shot status line shown in the footer; cleared on the next
     /// key handled in normal mode.
     notice: Option<String>,
+    /// Whether the side preview panel is shown.
+    preview_on: bool,
+    /// Our floating pane's geometry (x, y, cols, rows) captured before
+    /// expanding to full width, so we can restore it when preview is closed.
+    saved_geom: Option<(usize, usize, usize, usize)>,
+    /// Cached pane-screen dumps, keyed by (session name, terminal pane id).
+    /// Populated asynchronously from `dump-screen` via `RunCommandResult`.
+    previews: BTreeMap<(String, u32), Vec<String>>,
+    /// Dumps currently in flight, so we don't fire duplicate commands.
+    preview_pending: BTreeSet<(String, u32)>,
 }
 
 /// One row group in the (possibly filtered) list. Selection, activation and
@@ -44,12 +55,15 @@ impl ZellijPlugin for State {
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
+            // Needed to shell out to `zellij action dump-screen` for previews.
+            PermissionType::RunCommands,
         ]);
         subscribe(&[
             EventType::SessionUpdate,
             EventType::Key,
             EventType::Timer,
             EventType::PermissionRequestResult,
+            EventType::RunCommandResult,
         ]);
     }
 
@@ -84,9 +98,23 @@ impl ZellijPlugin for State {
                 let plugin_id = get_plugin_ids().plugin_id;
                 rename_plugin_pane(plugin_id, format!("Sessioner {}", frame));
                 set_timeout(2.0);
+                // Keep the visible preview live by re-dumping the selected pane.
+                if self.preview_on {
+                    self.request_preview(true);
+                }
                 changed
             }
-            Event::Key(key) => self.handle_key(key),
+            Event::Key(key) => {
+                let rerender = self.handle_key(key);
+                // After a selection change, lazily fetch the preview if needed.
+                if self.preview_on {
+                    self.request_preview(false);
+                }
+                rerender
+            }
+            Event::RunCommandResult(_exit, stdout, _stderr, context) => {
+                self.handle_command_result(stdout, context)
+            }
             _ => false,
         }
     }
@@ -156,11 +184,11 @@ impl ZellijPlugin for State {
             keyhints(&[
                 ("\u{2191}\u{2193}/jk", "navigate"),
                 ("/", "search"),
+                ("p", "preview"),
                 ("Enter", "attach/new"),
                 ("r", "rename"),
                 ("x", "kill"),
                 ("d", "kill dead"),
-                ("D", "kill all dead"),
                 ("Esc", "quit"),
             ])
         };
@@ -181,9 +209,29 @@ impl ZellijPlugin for State {
             return;
         }
 
+        // When the preview is on, split the body: a compact list on the left,
+        // the pane dump filling the rest, with a separator column between them.
+        let list_cols = if self.preview_on {
+            (cols / 3).clamp(24, 48).min(cols.saturating_sub(4))
+        } else {
+            cols
+        };
+
         let lines = self.build_list_lines(&entries, body_height);
         for (i, text) in lines.into_iter().enumerate() {
-            print_text_with_coordinates(text, 0, 1 + i, Some(cols), Some(1));
+            print_text_with_coordinates(text, 0, 1 + i, Some(list_cols), Some(1));
+        }
+
+        if self.preview_on {
+            for row in 0..body_height {
+                print_text_with_coordinates(
+                    Text::new("\u{2502}"),
+                    list_cols, 1 + row, Some(1), Some(1),
+                );
+            }
+            let px = list_cols + 1;
+            let pw = cols.saturating_sub(px);
+            self.render_preview(px, 1, pw, body_height);
         }
     }
 }
@@ -495,6 +543,11 @@ impl State {
             return true;
         }
 
+        if key.is_key_without_modifier(BareKey::Char('p')) {
+            self.toggle_preview();
+            return true;
+        }
+
         if key.is_key_without_modifier(BareKey::Enter) {
             self.activate_selected();
             return false;
@@ -651,6 +704,255 @@ impl State {
         }
         self.notice = Some("Can only rename the attached session".to_string());
     }
+
+    /// Geometry (x, y, cols, rows) of our own floating plugin pane, read from
+    /// the current session's manifest.
+    fn my_geom(&self, plugin_id: u32) -> Option<(usize, usize, usize, usize)> {
+        let session = self.sessions.iter().find(|s| s.is_current_session)?;
+        for panes in session.panes.panes.values() {
+            for pane in panes {
+                if pane.is_plugin && pane.id == plugin_id {
+                    return Some((pane.pane_x, pane.pane_y, pane.pane_columns, pane.pane_rows));
+                }
+            }
+        }
+        None
+    }
+
+    /// Toggle the preview panel. When enabling, the floating pane is expanded
+    /// to full screen width (keeping its vertical position/size); when
+    /// disabling, it is restored to the geometry captured on enable.
+    fn toggle_preview(&mut self) {
+        self.preview_on = !self.preview_on;
+        let plugin_id = get_plugin_ids().plugin_id;
+
+        if self.preview_on {
+            if self.saved_geom.is_none() {
+                self.saved_geom = self.my_geom(plugin_id);
+            }
+            let mut coords = FloatingPaneCoordinates::default()
+                .with_x_percent(0)
+                .with_width_percent(100);
+            // Keep the original vertical position/height if we know it.
+            if let Some((_, y, _, h)) = self.saved_geom {
+                coords = coords.with_y_fixed(y).with_height_fixed(h);
+            }
+            change_floating_panes_coordinates(vec![(PaneId::Plugin(plugin_id), coords)]);
+        } else if let Some((x, y, w, h)) = self.saved_geom.take() {
+            let coords = FloatingPaneCoordinates::default()
+                .with_x_fixed(x)
+                .with_y_fixed(y)
+                .with_width_fixed(w)
+                .with_height_fixed(h);
+            change_floating_panes_coordinates(vec![(PaneId::Plugin(plugin_id), coords)]);
+        }
+    }
+
+    /// The focused non-plugin pane of a session (falling back to its first
+    /// non-plugin pane), as a terminal pane id suitable for `--pane-id`.
+    fn focused_pane_id(session: &SessionInfo) -> Option<u32> {
+        let mut first = None;
+        let mut tab_indices: Vec<&usize> = session.panes.panes.keys().collect();
+        tab_indices.sort();
+        for tab_idx in tab_indices {
+            if let Some(panes) = session.panes.panes.get(tab_idx) {
+                for pane in panes {
+                    if pane.is_plugin {
+                        continue;
+                    }
+                    if first.is_none() {
+                        first = Some(pane.id);
+                    }
+                    if pane.is_focused {
+                        return Some(pane.id);
+                    }
+                }
+            }
+        }
+        first
+    }
+
+    /// (session name, pane id) to preview for the current selection, or `None`
+    /// when the selection isn't a live session.
+    fn selected_preview_target(&self) -> Option<(String, u32)> {
+        let entries = self.visible_entries();
+        if let Some(Entry::Live(i)) = entries.get(self.selected) {
+            let session = self.sessions.get(*i)?;
+            let pane_id = Self::focused_pane_id(session)?;
+            return Some((session.name.clone(), pane_id));
+        }
+        None
+    }
+
+    /// Fire an async `dump-screen` for the selected pane if we don't already
+    /// have it (or `force` to refresh). The result lands in `update` as a
+    /// `RunCommandResult` event, correlated by the `context` map.
+    fn request_preview(&mut self, force: bool) {
+        let Some(key) = self.selected_preview_target() else {
+            return;
+        };
+        if self.preview_pending.contains(&key) {
+            return;
+        }
+        if !force && self.previews.contains_key(&key) {
+            return;
+        }
+        let (session, pane_id) = key.clone();
+        self.preview_pending.insert(key);
+
+        let pane_arg = format!("terminal_{}", pane_id);
+        let mut env = BTreeMap::new();
+        env.insert("ZELLIJ_SESSION_NAME".to_string(), session.clone());
+        let mut context = BTreeMap::new();
+        context.insert("kind".to_string(), "preview".to_string());
+        context.insert("sid".to_string(), session);
+        context.insert("pid".to_string(), pane_id.to_string());
+
+        run_command_with_env_variables_and_cwd(
+            &[
+                "zellij", "action", "dump-screen",
+                "--pane-id", pane_arg.as_str(),
+                "--ansi", // keep SGR color codes so the preview renders in color
+            ],
+            env,
+            PathBuf::from("/"),
+            context,
+        );
+    }
+
+    /// Store the result of a preview `dump-screen`, keyed back to its pane via
+    /// the `context` map we sent. Returns whether to re-render.
+    fn handle_command_result(
+        &mut self,
+        stdout: Vec<u8>,
+        context: BTreeMap<String, String>,
+    ) -> bool {
+        if context.get("kind").map(String::as_str) != Some("preview") {
+            return false;
+        }
+        let (Some(sid), Some(pid)) = (context.get("sid"), context.get("pid")) else {
+            return false;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            return false;
+        };
+        let key = (sid.clone(), pid);
+        let lines = String::from_utf8_lossy(&stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        self.previews.insert(key.clone(), lines);
+        self.preview_pending.remove(&key);
+        true
+    }
+
+    /// Draw the preview panel in the region (x, y, w, h).
+    ///
+    /// The header uses the `Text` API (theme colors), but the pane dump is
+    /// emitted as raw ANSI: the `--ansi` dump carries SGR color codes, and the
+    /// `Text` API can only express theme-palette indices, so passing the bytes
+    /// straight through is the only way to preserve real terminal color.
+    fn render_preview(&self, x: usize, y: usize, w: usize, h: usize) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let target = self.selected_preview_target();
+        let header = match &target {
+            Some((s, _)) => format!("preview: {}", s),
+            None => "preview".to_string(),
+        };
+        print_text_with_coordinates(
+            Text::new(&header).color_range(2, ..),
+            x, y, Some(w), Some(1),
+        );
+
+        let content_y = y + 1;
+        let content_h = h.saturating_sub(1);
+        if content_h == 0 {
+            return;
+        }
+
+        // Clear the content region first (erase-to-EOL from the preview's left
+        // edge leaves the list and separator untouched, since they sit to the
+        // left of column `x`).
+        for row in 0..content_h {
+            print!("\u{1b}[{};{}H\u{1b}[K", content_y + row + 1, x + 1);
+        }
+
+        match target.as_ref().and_then(|k| self.previews.get(k)) {
+            Some(lines) => {
+                for (row, line) in lines.iter().take(content_h).enumerate() {
+                    // Position at the preview column (CUP is 1-based), then emit
+                    // the line's raw bytes (with their SGR colors), clipped to
+                    // the panel width and reset at the end to avoid bleed.
+                    print!(
+                        "\u{1b}[{};{}H{}",
+                        content_y + row + 1,
+                        x + 1,
+                        clip_ansi(line, w),
+                    );
+                }
+            }
+            None => {
+                let msg = if target.is_some() {
+                    "  loading\u{2026}"
+                } else {
+                    "  (select a live session)"
+                };
+                print_text_with_coordinates(
+                    Text::new(msg).color_range(1, ..),
+                    x, content_y, Some(w), Some(1),
+                );
+            }
+        }
+    }
+}
+
+/// Truncate an ANSI-styled line to `max_visible` printable columns, copying
+/// escape sequences through verbatim (they don't consume columns) and
+/// appending a reset so styling can't bleed past the clip.
+fn clip_ansi(line: &str, max_visible: usize) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut visible = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            out.push(c);
+            match chars.peek() {
+                // CSI (e.g. SGR `ESC [ … m`): copy until the final byte 0x40–0x7E.
+                Some('[') => {
+                    out.push(chars.next().unwrap());
+                    while let Some(&pc) = chars.peek() {
+                        out.push(chars.next().unwrap());
+                        if ('@'..='~').contains(&pc) {
+                            break;
+                        }
+                    }
+                }
+                // OSC (`ESC ] … BEL`): copy until BEL.
+                Some(']') => {
+                    out.push(chars.next().unwrap());
+                    while let Some(&pc) = chars.peek() {
+                        out.push(chars.next().unwrap());
+                        if pc == '\u{7}' {
+                            break;
+                        }
+                    }
+                }
+                // Other two-byte escapes: copy the following byte.
+                Some(_) => out.push(chars.next().unwrap()),
+                None => {}
+            }
+            continue;
+        }
+        if visible >= max_visible {
+            break;
+        }
+        out.push(c);
+        visible += 1;
+    }
+    out.push_str("\u{1b}[0m");
+    out
 }
 
 /// Build a Text with key names highlighted (color 3) and labels plain.
