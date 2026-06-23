@@ -17,3 +17,6 @@ jobs:
           components: clippy
       - run: cargo clippy -- -D warnings
       - run: cargo build --release
+      # Unit tests run on the host target: .cargo/config.toml pins the build to
+      # wasm32-wasip1, which can't execute a test binary natively.
+      - run: cargo test --target x86_64-unknown-linux-gnu

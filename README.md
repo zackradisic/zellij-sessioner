@@ -109,6 +109,16 @@ zellij action launch-or-focus-plugin \
   --floating
 ```
 
+### Tests
+
+The ANSI/SGR preview parser has unit tests. `.cargo/config.toml` pins the build
+to `wasm32-wasip1`, which can't run a test binary, so tests run on the host
+target:
+
+```bash
+cargo test --target $(rustc -vV | sed -n 's/host: //p')
+```
+
 ## Keybindings
 
 | Key | Action |
