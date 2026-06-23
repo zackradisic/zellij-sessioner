@@ -1,0 +1,100 @@
+#!/bin/sh
+# pane-notify — annotate the current zellij pane over `zellij pipe`.
+#
+# The zellij-sessioner plugin renders these annotations in its session list, so
+# any process (a Claude Code hook, a build, a test watcher) can flag a pane as
+# needing attention or carrying state.
+#
+# Usage:
+#   pane-notify <op> [key=value ...] [-- <free-form text>]
+#
+# Ops (see README "Pane annotation bus"):
+#   set    key=<k> [level=info|warn|error] -- <value>   set state; level also rings the bell
+#   append key=<k> [max=<n>]               -- <item>     push onto a list (ring buffer)
+#   remove key=<k>                         [-- <item>]   drop an item, or the whole key
+#   incr   key=<k> [by=<n>]                              bump a counter
+#   notify [level=info|warn|error]         -- <label>    ring the attention bell only
+#   clear  [key=<k>]                                     drop a key, or the whole pane
+#
+# session= and pane= are filled from the zellij environment automatically.
+# Free-form text after `--` (which may contain commas/spaces) is sent as the
+# pipe payload; structured fields go in --args (comma-separated, keep simple).
+#
+# Routing: messages must be targeted at the plugin's URL (broadcast does not reach
+# it in practice). The URL is taken from $SESSIONER_PLUGIN if set, else derived
+# from the LaunchOrFocusPlugin entry in the zellij config (see README "Routing").
+
+set -eu
+
+# Outside zellij there's nothing to annotate — no-op so hooks stay harmless.
+[ -n "${ZELLIJ_PANE_ID:-}" ] || exit 0
+
+op="${1:-}"
+if [ -z "$op" ]; then
+    echo "pane-notify: missing op" >&2
+    exit 2
+fi
+shift
+
+args="session=${ZELLIJ_SESSION_NAME:-},pane=${ZELLIJ_PANE_ID}"
+payload=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --)
+            shift
+            payload="$*"
+            break
+            ;;
+        *=*)
+            args="${args},$1"
+            ;;
+        *)
+            echo "pane-notify: expected 'key=value' or '--', got '$1'" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+# `zellij pipe` blocks the caller until a receiving plugin unblocks the pipe
+# (the sessioner does so the instant it handles the message). But if no sessioner
+# is listening, it would block forever — so this MUST be fire-and-forget:
+#   - cap the wait with timeout(1) when available (kills a stuck pipe), and
+#   - background it so the calling hook returns immediately regardless.
+# The value is the positional PAYLOAD (after `--`), never stdin: a piped stdin
+# makes `zellij pipe` treat the input as a streaming pipe and block.
+TIMEOUT=""
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT="timeout 2"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT="gtimeout 2"
+fi
+
+# Resolve the sessioner plugin URL. A targeted `--plugin <url>` is required:
+# broadcast (`zellij pipe` with no --plugin) does NOT reach the plugin. Prefer an
+# explicit $SESSIONER_PLUGIN; otherwise derive it from the LaunchOrFocusPlugin
+# entry in the zellij config, so the keybind URL stays the single source of truth.
+plugin="${SESSIONER_PLUGIN:-}"
+if [ -z "$plugin" ]; then
+    for cfg in \
+        "${ZELLIJ_CONFIG_FILE:-}" \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/zellij/config.kdl" \
+        "$HOME/.config/zellij/config.kdl"
+    do
+        [ -n "$cfg" ] && [ -f "$cfg" ] || continue
+        plugin=$(grep -oE 'LaunchOrFocusPlugin[[:space:]]+"[^"]*sessioner[^"]*\.wasm"' "$cfg" 2>/dev/null \
+            | head -1 | sed -E 's/.*"(.*)"/\1/')
+        [ -n "$plugin" ] && break
+    done
+fi
+
+if [ -n "$plugin" ]; then
+    set -- pipe --plugin "$plugin" --name "$op" --args "$args" -- "$payload"
+else
+    # Last resort (no URL found): broadcast. Known not to reach the plugin in
+    # practice, but better than erroring — and harmless.
+    set -- pipe --name "$op" --args "$args" -- "$payload"
+fi
+
+# shellcheck disable=SC2086
+$TIMEOUT zellij "$@" </dev/null >/dev/null 2>&1 &

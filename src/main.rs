@@ -38,18 +38,86 @@ struct State {
     /// Our floating pane's geometry (x, y, cols, rows) captured before
     /// expanding to full width, so we can restore it when preview is closed.
     saved_geom: Option<(usize, usize, usize, usize)>,
-    /// When true, j/k scroll through the selected session's tabs (and the
-    /// preview follows) instead of through the session list. Entered with `l`,
-    /// left with `h`.
-    tab_focus: bool,
-    /// Index (into the selected session's tab positions) being previewed while
-    /// in tab focus.
+    /// Navigation depth into the selected session, controlled by `l` (deeper)
+    /// and `h` (shallower): `Session` (move between sessions) → `Tab` (the
+    /// session expands and j/k moves between its tabs) → `Pane` (j/k moves
+    /// between the selected tab's panes).
+    focus: Focus,
+    /// Index (into the selected session's tab positions) of the selected tab,
+    /// while expanded. The preview follows it.
     selected_tab: usize,
+    /// Index (into the selected tab's panes) of the selected pane, at `Pane` depth.
+    selected_pane: usize,
     /// Cached pane-screen dumps, keyed by (session name, terminal pane id).
     /// Populated asynchronously from `dump-screen` via `RunCommandResult`.
     previews: BTreeMap<(String, u32), Vec<String>>,
     /// Dumps currently in flight, so we don't fire duplicate commands.
     preview_pending: BTreeSet<(String, u32)>,
+    /// Annotations attached to panes by external producers over `zellij pipe`,
+    /// keyed by (session name, terminal pane id) — the same shape as `previews`.
+    /// This is the sole source of truth for pane state/attention; it lives only
+    /// in memory, scoped to this zellij session's lifetime.
+    annotations: BTreeMap<(String, u32), PaneAnno>,
+    /// When true, the list is filtered to only sessions with an unacknowledged
+    /// attention bell ("show me only what's waiting"). Toggled with `a`.
+    only_attention: bool,
+}
+
+/// How deep navigation has drilled into the selected session. `l` deepens,
+/// `h` shallows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum Focus {
+    /// Move between sessions (the default).
+    #[default]
+    Session,
+    /// The selected session is expanded; move between its tabs.
+    Tab,
+    /// Move between the selected tab's individual panes.
+    Pane,
+}
+
+/// A typed annotation value. Producers manipulate these with operations
+/// (`set`/`append`/`incr`/…) rather than assigning whole values, so the plugin —
+/// the single owner — applies the logic and there's no read-modify-write race.
+#[derive(Clone, Debug, PartialEq)]
+enum Value {
+    Str(String),
+    List(Vec<String>),
+    Counter(i64),
+}
+
+/// Severity of an attention bell, governing its display precedence and color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Level {
+    Info,
+    Warn,
+    Error,
+}
+
+/// A transient "look at me" bell raised by a producer event. Unlike state
+/// (which is overwritten by the next event), attention is cleared by the *user*
+/// seeing the pane — see `mark_session_seen` / the `PaneUpdate` handler.
+#[derive(Clone, Debug, PartialEq)]
+struct Attention {
+    level: Level,
+    label: String,
+    producer: String,
+}
+
+/// Everything annotated onto a single pane.
+#[derive(Clone, Default, Debug, PartialEq)]
+struct PaneAnno {
+    /// Producer-namespaced state values (e.g. `"claude" -> Str("waiting")`).
+    states: BTreeMap<String, Value>,
+    /// The attention bell; `None` once acknowledged (seen).
+    attention: Option<Attention>,
+}
+
+impl PaneAnno {
+    /// True once there's nothing left to display, so the entry can be dropped.
+    fn is_empty(&self) -> bool {
+        self.states.is_empty() && self.attention.is_none()
+    }
 }
 
 /// One row group in the (possibly filtered) list. Selection, activation and
@@ -91,6 +159,8 @@ impl ZellijPlugin for State {
             PermissionType::ChangeApplicationState,
             // Needed to shell out to `zellij action dump-screen` for previews.
             PermissionType::RunCommands,
+            // Needed to receive annotations piped in via `zellij pipe`.
+            PermissionType::ReadCliPipes,
         ]);
         subscribe(&[
             EventType::SessionUpdate,
@@ -98,6 +168,9 @@ impl ZellijPlugin for State {
             EventType::Timer,
             EventType::PermissionRequestResult,
             EventType::RunCommandResult,
+            // Drives the manual-focus "seen" transition: focusing a pane with an
+            // attention bell acknowledges it.
+            EventType::PaneUpdate,
         ]);
     }
 
@@ -150,6 +223,9 @@ impl ZellijPlugin for State {
             Event::RunCommandResult(_exit, stdout, _stderr, context) => {
                 self.handle_command_result(stdout, context)
             }
+            // Manual-focus "seen": focusing a pane in the attached session that
+            // carries an attention bell acknowledges it.
+            Event::PaneUpdate(manifest) => self.handle_pane_focus(&manifest),
             _ => false,
         }
     }
@@ -215,10 +291,20 @@ impl ZellijPlugin for State {
                 ("Enter", "attach/new"),
                 ("Esc", "clear"),
             ])
-        } else if self.tab_focus {
+        } else if self.focus == Focus::Pane {
+            keyhints(&[
+                ("\u{2191}\u{2193}/jk", "pane"),
+                ("h", "tabs"),
+                ("m", "done"),
+                ("Enter", "attach"),
+                ("Esc", "quit"),
+            ])
+        } else if self.focus == Focus::Tab {
             keyhints(&[
                 ("\u{2191}\u{2193}/jk", "tab"),
-                ("h", "back to sessions"),
+                ("l", "panes"),
+                ("h", "sessions"),
+                ("m", "done"),
                 ("Enter", "attach"),
                 ("Esc", "quit"),
             ])
@@ -226,11 +312,12 @@ impl ZellijPlugin for State {
             keyhints(&[
                 ("\u{2191}\u{2193}/jk", "navigate"),
                 ("/", "search"),
+                ("a", if self.only_attention { "all" } else { "waiting" }),
+                ("m", "done"),
                 ("p", "preview"),
                 ("l", "tabs"),
                 ("Enter", "attach/new"),
                 ("x", "kill"),
-                ("d", "kill dead"),
                 ("Esc", "quit"),
             ])
         };
@@ -259,13 +346,9 @@ impl ZellijPlugin for State {
             cols
         };
 
-        // In tab focus the left panel lists the session's tabs; otherwise the
-        // session list.
-        let lines = if self.tab_focus {
-            self.build_tab_lines(body_height)
-        } else {
-            self.build_list_lines(&entries, body_height)
-        };
+        // The session list is the only view; in tab focus the selected session
+        // expands into its tabs in place (handled inside build_list_lines).
+        let lines = self.build_list_lines(&entries, body_height);
         for (i, text) in lines.into_iter().enumerate() {
             print_text_with_coordinates(text, 0, 1 + i, Some(list_cols), Some(1));
         }
@@ -282,6 +365,141 @@ impl ZellijPlugin for State {
             self.render_preview(px, 1, pw, body_height);
         }
     }
+
+    /// Receive an annotation from `zellij pipe`. The message carries an op in
+    /// `name`, structured fields in `args` (session/pane/key/producer/level),
+    /// and free-form text in `payload` (so values may contain commas/spaces).
+    /// The producer sends an *operation*, not a value, so all the logic lives
+    /// here in the single owner — appends and counters can't race.
+    fn pipe(&mut self, msg: PipeMessage) -> bool {
+        // A CLI pipe blocks the `zellij pipe` caller until it's unblocked.
+        // Producers are fire-and-forget, so release the caller immediately —
+        // before any early return below — so a hook can never hang on us.
+        // (wasm-only: the shim routes through a host import absent in native
+        // test builds, and there's no pipe to unblock off-wasm anyway.)
+        #[cfg(target_family = "wasm")]
+        if let PipeSource::Cli(pipe_id) = &msg.source {
+            unblock_cli_pipe_input(pipe_id);
+        }
+
+        // Addressing: session + pane id are required. Bail (no re-render) if the
+        // message isn't a well-formed pane annotation.
+        let Some(session) = msg.args.get("session").cloned() else {
+            return false;
+        };
+        let Some(pane) = msg.args.get("pane").and_then(|p| p.parse::<u32>().ok()) else {
+            return false;
+        };
+        let key = msg.args.get("key").cloned();
+        let value = msg
+            .payload
+            .clone()
+            .or_else(|| msg.args.get("value").cloned());
+        let producer = msg
+            .args
+            .get("producer")
+            .cloned()
+            .unwrap_or_else(|| "anon".to_string());
+        let level = msg.args.get("level").map(|l| match l.as_str() {
+            "error" => Level::Error,
+            "warn" => Level::Warn,
+            _ => Level::Info,
+        });
+
+        let map_key = (session, pane);
+
+        match msg.name.as_str() {
+            "set" => {
+                let (Some(k), Some(v)) = (key, value.clone()) else {
+                    return false;
+                };
+                let anno = self.annotations.entry(map_key).or_default();
+                anno.states.insert(k, Value::Str(v.clone()));
+                if let Some(level) = level {
+                    anno.attention = Some(Attention { level, label: v, producer });
+                }
+            }
+            "append" => {
+                let (Some(k), Some(v)) = (key, value) else {
+                    return false;
+                };
+                let max = msg.args.get("max").and_then(|m| m.parse::<usize>().ok());
+                let anno = self.annotations.entry(map_key).or_default();
+                let list = match anno.states.entry(k).or_insert_with(|| Value::List(Vec::new())) {
+                    Value::List(l) => l,
+                    // Coerce a mismatched value into a fresh list.
+                    slot => {
+                        *slot = Value::List(Vec::new());
+                        let Value::List(l) = slot else { unreachable!() };
+                        l
+                    }
+                };
+                list.push(v);
+                if let Some(max) = max {
+                    let overflow = list.len().saturating_sub(max);
+                    if overflow > 0 {
+                        list.drain(0..overflow);
+                    }
+                }
+            }
+            "remove" => {
+                let Some(k) = key else { return false };
+                if let Some(anno) = self.annotations.get_mut(&map_key) {
+                    match (value, anno.states.get_mut(&k)) {
+                        // Remove a single item from a list.
+                        (Some(v), Some(Value::List(l))) => l.retain(|x| x != &v),
+                        // No value, or a non-list value: drop the whole key.
+                        _ => {
+                            anno.states.remove(&k);
+                        }
+                    }
+                    if anno.is_empty() {
+                        self.annotations.remove(&map_key);
+                    }
+                }
+            }
+            "incr" => {
+                let Some(k) = key else { return false };
+                let by = msg
+                    .args
+                    .get("by")
+                    .and_then(|b| b.parse::<i64>().ok())
+                    .unwrap_or(1);
+                let anno = self.annotations.entry(map_key).or_default();
+                match anno.states.entry(k).or_insert(Value::Counter(0)) {
+                    Value::Counter(n) => *n += by,
+                    slot => *slot = Value::Counter(by),
+                }
+            }
+            "notify" => {
+                let anno = self.annotations.entry(map_key).or_default();
+                anno.attention = Some(Attention {
+                    level: level.unwrap_or(Level::Info),
+                    label: value.unwrap_or_default(),
+                    producer,
+                });
+            }
+            "clear" => {
+                match key {
+                    // Clear one key; drop the pane entry if nothing's left.
+                    Some(k) => {
+                        if let Some(anno) = self.annotations.get_mut(&map_key) {
+                            anno.states.remove(&k);
+                            if anno.is_empty() {
+                                self.annotations.remove(&map_key);
+                            }
+                        }
+                    }
+                    // Clear the whole pane.
+                    None => {
+                        self.annotations.remove(&map_key);
+                    }
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
 }
 
 impl State {
@@ -292,31 +510,40 @@ impl State {
     fn visible_entries(&self) -> Vec<Entry> {
         let q = self.query.trim().to_lowercase();
 
+        let mut entries = Vec::new();
         if q.is_empty() {
-            let mut entries = Vec::with_capacity(self.entry_count());
+            entries.reserve(self.entry_count());
             entries.push(Entry::New);
             entries.extend((0..self.sessions.len()).map(Entry::Live));
             entries.extend((0..self.resurrectable.len()).map(Entry::Dead));
-            return entries;
+        } else {
+            // Live sessions match on their name or any of their pane titles.
+            for (i, session) in self.sessions.iter().enumerate() {
+                let name_match = session.name.to_lowercase().contains(&q);
+                let pane_match = Self::pane_titles(session)
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(&q));
+                if name_match || pane_match {
+                    entries.push(Entry::Live(i));
+                }
+            }
+            // Dead sessions match on their name only.
+            for (i, (name, _)) in self.resurrectable.iter().enumerate() {
+                if name.to_lowercase().contains(&q) {
+                    entries.push(Entry::Dead(i));
+                }
+            }
         }
 
-        let mut entries = Vec::new();
-        // Live sessions match on their name or any of their pane titles.
-        for (i, session) in self.sessions.iter().enumerate() {
-            let name_match = session.name.to_lowercase().contains(&q);
-            let pane_match = Self::pane_titles(session)
-                .iter()
-                .any(|t| t.to_lowercase().contains(&q));
-            if name_match || pane_match {
-                entries.push(Entry::Live(i));
-            }
+        // "Show only what's waiting": keep just live sessions whose panes carry
+        // an unacknowledged attention bell.
+        if self.only_attention {
+            entries.retain(|e| match e {
+                Entry::Live(i) => self.session_attention(&self.sessions[*i].name).is_some(),
+                _ => false,
+            });
         }
-        // Dead sessions match on their name only.
-        for (i, (name, _)) in self.resurrectable.iter().enumerate() {
-            if name.to_lowercase().contains(&q) {
-                entries.push(Entry::Dead(i));
-            }
-        }
+
         entries
     }
 
@@ -351,9 +578,10 @@ impl State {
         }
     }
 
-    /// Collect pane titles for a session, excluding plugin panes.
-    fn pane_titles(session: &SessionInfo) -> Vec<String> {
-        let mut titles = Vec::new();
+    /// (pane id, title) for each non-plugin pane in a session, in tab order.
+    /// The id lets us join against `annotations` for per-pane badges.
+    fn visible_panes(session: &SessionInfo) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
         let mut tab_indices: Vec<&usize> = session.panes.panes.keys().collect();
         tab_indices.sort();
         for tab_idx in tab_indices {
@@ -362,65 +590,107 @@ impl State {
                     if pane.is_plugin {
                         continue;
                     }
-                    titles.push(pane.title.clone());
+                    out.push((pane.id, pane.title.clone()));
                 }
             }
         }
-        titles
+        out
     }
 
-    /// Number of body lines an entry occupies (header + any detail lines).
-    fn entry_lines(&self, entry: &Entry) -> usize {
-        match entry {
-            Entry::New => 1,
-            Entry::Live(i) => 1 + Self::pane_titles(&self.sessions[*i]).len(),
-            Entry::Dead(_) => 2,
+    /// Collect pane titles for a session, excluding plugin panes.
+    fn pane_titles(session: &SessionInfo) -> Vec<String> {
+        Self::visible_panes(session)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect()
+    }
+
+    /// The worst (highest-precedence) unacknowledged attention level across a
+    /// session's panes, if any — drives the session-header aggregate badge.
+    fn session_attention(&self, name: &str) -> Option<Level> {
+        self.annotations
+            .iter()
+            .filter(|((s, _), _)| s == name)
+            .filter_map(|(_, a)| a.attention.as_ref().map(|att| att.level))
+            .max()
+    }
+
+    /// A session's tabs as (tab name, its pane (id, title) list), in tab order —
+    /// used to render the inline tab expansion when a session is opened with `l`.
+    fn session_tabs(session: &SessionInfo) -> Vec<(String, Vec<(u32, String)>)> {
+        Self::sorted_tab_positions(session)
+            .iter()
+            .map(|pos| {
+                let name = session
+                    .tabs
+                    .iter()
+                    .find(|t| t.position == *pos)
+                    .map(|t| t.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| format!("tab {}", pos + 1));
+                let panes = session
+                    .panes
+                    .panes
+                    .get(pos)
+                    .map(|ps| {
+                        ps.iter()
+                            .filter(|p| !p.is_plugin)
+                            .map(|p| (p.id, p.title.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (name, panes)
+            })
+            .collect()
+    }
+
+    /// One indented pane-title line with its annotation badge. `indent` is the
+    /// left padding in columns; `selected` highlights it. Shared by the session
+    /// list and the per-tab view so the badge layout lives in one place.
+    fn pane_line(&self, session: &str, id: u32, title: &str, indent: usize, selected: bool) -> Text {
+        let pad = " ".repeat(indent);
+        let badge = self
+            .annotations
+            .get(&(session.to_string(), id))
+            .and_then(anno_badge);
+        let (text, title_start, glyph) = match badge {
+            Some((g, color)) => {
+                let g_len = g.chars().count();
+                (format!("{}{} {}", pad, g, title), indent + g_len + 1, Some((g_len, color)))
+            }
+            None => (format!("{}{}", pad, title), indent, None),
+        };
+        let mut item = Text::new(&text);
+        if let Some((g_len, color)) = glyph {
+            item = item.color_range(color, indent..indent + g_len);
         }
+        item = item.color_range(1, title_start..);
+        if selected {
+            item = item.selected();
+        }
+        item
     }
 
     /// Build text lines for the body with scroll support. `entries` is the
     /// filtered, display-ordered list; `self.selected` indexes into it.
+    ///
+    /// When the selected session is expanded (`Focus::Tab`/`Pane` via `l`), it
+    /// shows its tabs in place with panes grouped under each — the rest of the
+    /// list stays put. The cursor is `selected_tab` at `Tab` depth, or
+    /// `selected_pane` within that tab at `Pane` depth. Otherwise each live
+    /// session shows its panes flat.
+    ///
+    /// Builds every line, recording the "anchor" range that must stay visible
+    /// (the selected session / tab block / pane), then returns the scrolled
+    /// window.
     fn build_list_lines(&mut self, entries: &[Entry], visible_rows: usize) -> Vec<Text> {
-        // Line offset of each entry's header, and the total line count.
-        let mut headers = Vec::with_capacity(entries.len());
-        let mut line = 0usize;
-        for entry in entries {
-            headers.push(line);
-            line += self.entry_lines(entry);
-        }
-        let total_lines = line;
-
-        // Scroll to keep the selected entry visible.
-        let sel_header = headers.get(self.selected).copied().unwrap_or(0);
-        let sel_size = entries
-            .get(self.selected)
-            .map(|e| self.entry_lines(e))
-            .unwrap_or(1);
-
-        if sel_header < self.scroll_offset {
-            self.scroll_offset = sel_header;
-        } else if sel_header + sel_size > self.scroll_offset + visible_rows {
-            self.scroll_offset = (sel_header + sel_size).saturating_sub(visible_rows);
-        }
-        if total_lines <= visible_rows {
-            self.scroll_offset = 0;
-        } else if self.scroll_offset > total_lines.saturating_sub(visible_rows) {
-            self.scroll_offset = total_lines.saturating_sub(visible_rows);
-        }
-
-        // Emit the visible Text lines.
-        let mut items = Vec::new();
-        let mut cur = 0usize;
-        let vis_end = self.scroll_offset + visible_rows;
-        let push_visible = |items: &mut Vec<Text>, cur: usize, text: Text| {
-            if cur >= self.scroll_offset && cur < vis_end {
-                items.push(text);
-            }
-        };
+        let mut lines: Vec<Text> = Vec::new();
+        let mut anchor_start = 0usize;
+        let mut anchor_size = 1usize;
 
         for (pos, entry) in entries.iter().enumerate() {
             let is_selected = self.selected == pos;
-            let prefix = if is_selected { "▸ " } else { "  " };
+            let prefix = if is_selected { "\u{25b8} " } else { "  " };
             let prefix_chars = prefix.chars().count();
 
             match entry {
@@ -429,9 +699,10 @@ impl State {
                     let mut item = Text::new(&label).color_range(2, prefix_chars..);
                     if is_selected {
                         item = item.selected();
+                        anchor_start = lines.len();
+                        anchor_size = 1;
                     }
-                    push_visible(&mut items, cur, item);
-                    cur += 1;
+                    lines.push(item);
                 }
                 Entry::Live(i) => {
                     let session = &self.sessions[*i];
@@ -443,26 +714,72 @@ impl State {
                         ""
                     };
 
-                    let text = format!("{}{}{}", prefix, session.name, suffix);
-                    let name_end = prefix_chars + session.name.len();
-                    let mut item = Text::new(&text).color_range(0, prefix_chars..name_end);
+                    // Aggregate attention bell, prefixed before the session name.
+                    let bell = self.session_attention(&session.name);
+                    let badge = if bell.is_some() { "● " } else { "" };
+                    let badge_chars = badge.chars().count();
+                    let text = format!("{}{}{}{}", prefix, badge, session.name, suffix);
+                    let name_start = prefix_chars + badge_chars;
+                    let name_end = name_start + session.name.chars().count();
+                    let mut item = Text::new(&text).color_range(0, name_start..name_end);
+                    if let Some(level) = bell {
+                        item = item.color_range(level_color(level), prefix_chars..name_start);
+                    }
                     if !suffix.is_empty() {
-                        item = item.color_range(2, name_end..text.len());
+                        item = item.color_range(2, name_end..text.chars().count());
                     }
-                    if is_selected {
-                        item = item.selected();
-                    }
-                    push_visible(&mut items, cur, item);
-                    cur += 1;
 
-                    for title in &Self::pane_titles(session) {
-                        let line_text = format!("    {}", title);
-                        let mut item = Text::new(&line_text).color_range(1, 4..);
-                        if is_selected {
-                            item = item.selected();
+                    let expanded = is_selected && self.focus != Focus::Session;
+                    // When expanded the cursor lives deeper (a tab or a pane), so
+                    // the session header keeps just its ▸ marker, not the full
+                    // highlight.
+                    if is_selected && !expanded {
+                        item = item.selected();
+                        anchor_start = lines.len();
+                        anchor_size = 1 + Self::visible_panes(session).len();
+                    }
+                    lines.push(item);
+
+                    if expanded {
+                        let pane_depth = self.focus == Focus::Pane;
+                        let tabs = Self::session_tabs(session);
+                        let sel_tab = self.selected_tab.min(tabs.len().saturating_sub(1));
+                        for (ti, (name, panes)) in tabs.iter().enumerate() {
+                            let tsel = ti == sel_tab;
+                            let tprefix = if tsel { "\u{25b8} " } else { "  " };
+                            let tprefix_chars = 4 + tprefix.chars().count();
+                            let num = ti + 1;
+                            let line_text = format!("    {}{}: {}", tprefix, num, name);
+                            let num_end = tprefix_chars + num.to_string().len();
+                            let mut header = Text::new(&line_text)
+                                .color_range(3, tprefix_chars..num_end)
+                                .color_range(0, num_end..);
+                            // At Tab depth the selected tab's whole block is the
+                            // highlight/anchor; at Pane depth the header only marks
+                            // the tab and the highlight moves to the selected pane.
+                            if tsel && !pane_depth {
+                                header = header.selected();
+                                anchor_start = lines.len();
+                                anchor_size = 1 + panes.len();
+                            }
+                            lines.push(header);
+
+                            let sel_pane = self.selected_pane.min(panes.len().saturating_sub(1));
+                            for (pi, (id, title)) in panes.iter().enumerate() {
+                                let psel = pane_depth && tsel && pi == sel_pane;
+                                let selected = if pane_depth { psel } else { tsel };
+                                let idx = lines.len();
+                                lines.push(self.pane_line(&session.name, *id, title, 8, selected));
+                                if psel {
+                                    anchor_start = idx;
+                                    anchor_size = 1;
+                                }
+                            }
                         }
-                        push_visible(&mut items, cur, item);
-                        cur += 1;
+                    } else {
+                        for (id, title) in Self::visible_panes(session) {
+                            lines.push(self.pane_line(&session.name, id, &title, 4, is_selected));
+                        }
                     }
                 }
                 Entry::Dead(i) => {
@@ -474,22 +791,40 @@ impl State {
                         .color_range(2, name_end..text.len());
                     if is_selected {
                         item = item.selected();
+                        anchor_start = lines.len();
+                        anchor_size = 2;
                     }
-                    push_visible(&mut items, cur, item);
-                    cur += 1;
+                    lines.push(item);
 
                     let info = format!("    exited {}", format_duration(*age));
-                    let mut item = Text::new(&info).color_range(1, 4..);
+                    let mut info_item = Text::new(&info).color_range(1, 4..);
                     if is_selected {
-                        item = item.selected();
+                        info_item = info_item.selected();
                     }
-                    push_visible(&mut items, cur, item);
-                    cur += 1;
+                    lines.push(info_item);
                 }
             }
         }
 
-        items
+        // Scroll to keep the anchor block visible.
+        let total = lines.len();
+        if anchor_start < self.scroll_offset {
+            self.scroll_offset = anchor_start;
+        } else if anchor_start + anchor_size > self.scroll_offset + visible_rows {
+            self.scroll_offset = (anchor_start + anchor_size).saturating_sub(visible_rows);
+        }
+        if total <= visible_rows {
+            self.scroll_offset = 0;
+        } else if self.scroll_offset > total.saturating_sub(visible_rows) {
+            self.scroll_offset = total.saturating_sub(visible_rows);
+        }
+
+        let end = (self.scroll_offset + visible_rows).min(total);
+        lines
+            .into_iter()
+            .skip(self.scroll_offset)
+            .take(end.saturating_sub(self.scroll_offset))
+            .collect()
     }
 
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
@@ -566,17 +901,33 @@ impl State {
         // Any keypress dismisses a one-shot notice.
         self.notice = None;
 
-        // `l` drills into the selected session's tabs; `h` pops back out.
+        // `l` drills deeper (session → tab → pane); `h` pops back out.
         if key.is_key_without_modifier(BareKey::Char('l')) {
-            self.enter_tab_focus();
+            match self.focus {
+                Focus::Session => self.enter_tab_focus(),
+                Focus::Tab => {
+                    // Only descend into panes if the selected tab has any.
+                    if self.selected_tab_pane_count() > 0 {
+                        self.focus = Focus::Pane;
+                        self.selected_pane = 0;
+                    }
+                }
+                Focus::Pane => {}
+            }
             return true;
         }
         if key.is_key_without_modifier(BareKey::Char('h')) {
-            if self.tab_focus {
-                self.tab_focus = false;
-                return true;
+            match self.focus {
+                Focus::Pane => {
+                    self.focus = Focus::Tab;
+                    return true;
+                }
+                Focus::Tab => {
+                    self.focus = Focus::Session;
+                    return true;
+                }
+                Focus::Session => return false,
             }
-            return false;
         }
 
         let up = key.is_key_without_modifier(BareKey::Up)
@@ -584,8 +935,19 @@ impl State {
         let down = key.is_key_without_modifier(BareKey::Down)
             || key.is_key_without_modifier(BareKey::Char('j'));
 
-        if self.tab_focus {
-            // j/k cycle the previewed tab.
+        if self.focus == Focus::Pane {
+            // j/k move between the selected tab's panes.
+            let count = self.selected_tab_pane_count();
+            if up && self.selected_pane > 0 {
+                self.selected_pane -= 1;
+            } else if down && count > 0 && self.selected_pane < count - 1 {
+                self.selected_pane += 1;
+            }
+            if up || down {
+                return true;
+            }
+        } else if self.focus == Focus::Tab {
+            // j/k cycle the selected tab (preview follows).
             let count = self.selected_tab_count();
             if up && self.selected_tab > 0 {
                 self.selected_tab -= 1;
@@ -618,6 +980,20 @@ impl State {
         if key.is_key_without_modifier(BareKey::Char('p')) {
             self.toggle_preview();
             return true;
+        }
+
+        // `a` toggles the "only sessions waiting on me" filter.
+        if key.is_key_without_modifier(BareKey::Char('a')) {
+            self.only_attention = !self.only_attention;
+            self.selected = 0;
+            self.clamp_selection();
+            return true;
+        }
+
+        // `m` manually marks the current selection's notification done (scoped to
+        // the navigation depth: pane / tab / session).
+        if key.is_key_without_modifier(BareKey::Char('m')) {
+            return self.mark_selected_done();
         }
 
         if key.is_key_without_modifier(BareKey::Enter) {
@@ -709,7 +1085,7 @@ impl State {
         false
     }
 
-    fn activate_selected(&self) {
+    fn activate_selected(&mut self) {
         let entries = self.visible_entries();
         let Some(entry) = entries.get(self.selected) else {
             return;
@@ -725,16 +1101,140 @@ impl State {
                     close_self();
                     return;
                 }
-                switch_session(Some(&session.name));
+                // Attaching drops us on the session's *active tab*, whose panes
+                // are all tiled into view — so only that tab's bells are "seen".
+                // Other tabs are unseen and keep their bells.
+                let name = session.name.clone();
+                let ids = Self::active_tab_pane_ids(session);
+                self.mark_panes_seen(&name, &ids);
+                switch_session(Some(&name));
                 close_self();
             }
             Entry::Dead(i) => {
+                // A dead session has no live panes — nothing to mark seen.
                 if let Some((name, _)) = self.resurrectable.get(*i) {
-                    switch_session(Some(name));
+                    let name = name.clone();
+                    switch_session(Some(&name));
                     close_self();
                 }
             }
         }
+    }
+
+    /// The attached session's name, if known.
+    fn current_session_name(&self) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|s| s.is_current_session)
+            .map(|s| s.name.clone())
+    }
+
+    /// Manual-focus "seen": when a pane in the attached session is focused and it
+    /// carries an attention bell, acknowledge it (state is left intact). Returns
+    /// whether anything changed, so we only re-render on a real transition.
+    fn handle_pane_focus(&mut self, manifest: &PaneManifest) -> bool {
+        let Some(session) = self.current_session_name() else {
+            return false;
+        };
+        let mut changed = false;
+        for panes in manifest.panes.values() {
+            for pane in panes {
+                if pane.is_plugin || !pane.is_focused {
+                    continue;
+                }
+                let k = (session.clone(), pane.id);
+                let cleared = self
+                    .annotations
+                    .get_mut(&k)
+                    .map(|a| a.attention.take().is_some())
+                    .unwrap_or(false);
+                if cleared {
+                    changed = true;
+                    if self.annotations.get(&k).map(PaneAnno::is_empty).unwrap_or(false) {
+                        self.annotations.remove(&k);
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Pane ids of a session's active tab (the one you land on when attaching),
+    /// excluding plugin panes.
+    fn active_tab_pane_ids(session: &SessionInfo) -> Vec<u32> {
+        let Some(pos) = session.tabs.iter().find(|t| t.active).map(|t| t.position) else {
+            return Vec::new();
+        };
+        session
+            .panes
+            .panes
+            .get(&pos)
+            .map(|ps| {
+                ps.iter()
+                    .filter(|p| !p.is_plugin)
+                    .map(|p| p.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Jump "seen": acknowledge the attention bell on the given panes of a
+    /// session (state values are preserved), dropping any entry left empty.
+    fn mark_panes_seen(&mut self, session: &str, ids: &[u32]) {
+        for &id in ids {
+            let k = (session.to_string(), id);
+            if let Some(anno) = self.annotations.get_mut(&k) {
+                anno.attention = None;
+            }
+            if self.annotations.get(&k).map(PaneAnno::is_empty).unwrap_or(false) {
+                self.annotations.remove(&k);
+            }
+        }
+    }
+
+    /// Remove every annotation (state *and* attention — any glyph) on the given
+    /// panes. Unlike `mark_panes_seen`, which only silences the bell, this fully
+    /// clears them. Returns whether anything was removed.
+    fn clear_panes(&mut self, session: &str, ids: &[u32]) -> bool {
+        let mut changed = false;
+        for &id in ids {
+            if self.annotations.remove(&(session.to_string(), id)).is_some() {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Manually "mark done" the current selection — clears any glyph entirely
+    /// (state and bell), scoped to the navigation depth: the selected pane at
+    /// `Pane` depth, the selected tab's panes at `Tab` depth, or the whole
+    /// session at `Session` depth. Returns whether to re-render.
+    fn mark_selected_done(&mut self) -> bool {
+        let Some(session) = self.selected_session() else {
+            return false;
+        };
+        let name = session.name.clone();
+        let ids: Vec<u32> = match self.focus {
+            Focus::Session => Self::visible_panes(session)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
+            Focus::Tab | Focus::Pane => {
+                let tabs = Self::session_tabs(session);
+                let sel = self.selected_tab.min(tabs.len().saturating_sub(1));
+                let panes = tabs.get(sel).map(|(_, p)| p.clone()).unwrap_or_default();
+                if self.focus == Focus::Pane {
+                    let pi = self.selected_pane.min(panes.len().saturating_sub(1));
+                    panes.get(pi).map(|(id, _)| vec![*id]).unwrap_or_default()
+                } else {
+                    panes.into_iter().map(|(id, _)| id).collect()
+                }
+            }
+        };
+        if ids.is_empty() {
+            return false;
+        }
+        self.clear_panes(&name, &ids)
     }
 
     fn delete_selected_dead(&self) {
@@ -796,10 +1296,6 @@ impl State {
     /// disabling, it is restored to the geometry captured on enable.
     fn toggle_preview(&mut self) {
         self.preview_on = !self.preview_on;
-        if !self.preview_on {
-            // No preview, no tab focus.
-            self.tab_focus = false;
-        }
         let plugin_id = get_plugin_ids().plugin_id;
 
         if self.preview_on {
@@ -849,6 +1345,16 @@ impl State {
             .unwrap_or(0)
     }
 
+    /// Number of panes in the selected session's selected tab (0 if none).
+    fn selected_tab_pane_count(&self) -> usize {
+        let Some(session) = self.selected_session() else {
+            return 0;
+        };
+        let tabs = Self::session_tabs(session);
+        let sel = self.selected_tab.min(tabs.len().saturating_sub(1));
+        tabs.get(sel).map(|(_, p)| p.len()).unwrap_or(0)
+    }
+
     /// The tab position to preview: the `selected_tab`-th tab while in tab
     /// focus, otherwise the active tab (falling back to the first).
     fn target_tab_position(&self, session: &SessionInfo) -> Option<usize> {
@@ -856,7 +1362,7 @@ impl State {
         if positions.is_empty() {
             return None;
         }
-        if self.tab_focus {
+        if self.focus != Focus::Session {
             let idx = self.selected_tab.min(positions.len() - 1);
             return positions.get(idx).copied();
         }
@@ -874,7 +1380,7 @@ impl State {
     fn enter_tab_focus(&mut self) {
         let active_idx = {
             let Some(session) = self.selected_session() else {
-                self.notice = Some("Select a live session to preview tabs".to_string());
+                self.notice = Some("Select a live session to open its tabs".to_string());
                 return;
             };
             let positions = Self::sorted_tab_positions(session);
@@ -889,41 +1395,11 @@ impl State {
                 .unwrap_or(0)
         };
         self.selected_tab = active_idx;
-        self.tab_focus = true;
-        if !self.preview_on {
-            self.toggle_preview();
-        }
-    }
-
-    /// Build the left-panel tab list for the selected session (tab focus mode).
-    fn build_tab_lines(&self, visible_rows: usize) -> Vec<Text> {
-        let mut items = Vec::new();
-        let Some(session) = self.selected_session() else {
-            return items;
-        };
-        let positions = Self::sorted_tab_positions(session);
-        for (i, pos) in positions.iter().enumerate().take(visible_rows) {
-            let name = session
-                .tabs
-                .iter()
-                .find(|t| t.position == *pos)
-                .map(|t| t.name.clone())
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| format!("tab {}", pos + 1));
-            let is_selected = i == self.selected_tab;
-            let prefix = if is_selected { "\u{25b8} " } else { "  " };
-            let text = format!("{}{}: {}", prefix, i + 1, name);
-            let prefix_chars = prefix.chars().count();
-            let num_end = prefix_chars + (i + 1).to_string().len();
-            let mut item = Text::new(&text)
-                .color_range(3, prefix_chars..num_end)
-                .color_range(0, num_end..);
-            if is_selected {
-                item = item.selected();
-            }
-            items.push(item);
-        }
-        items
+        self.selected_pane = 0;
+        self.focus = Focus::Tab;
+        // The selected session expands in place within the list; build_list_lines
+        // re-derives scroll to keep the selected tab visible. Preview is left to
+        // `p` — opening tabs no longer forces it on.
     }
 
     /// A short "tab i/n[: name]" indicator for the previewed tab.
@@ -1487,6 +1963,40 @@ fn keyhints(pairs: &[(&str, &str)]) -> Text {
     text
 }
 
+/// Palette color index (0–3, theme-relative) for an attention level.
+fn level_color(level: Level) -> usize {
+    match level {
+        Level::Error => 0,
+        Level::Warn => 3,
+        Level::Info => 2,
+    }
+}
+
+/// A status badge for a pane annotation: (glyph, palette color index).
+/// Attention takes visual precedence over state; once acknowledged, the
+/// underlying state glyph shows through (so a seen `waiting` still reads as
+/// waiting, just without the bell color).
+fn anno_badge(anno: &PaneAnno) -> Option<(&'static str, usize)> {
+    if let Some(att) = &anno.attention {
+        return Some(("●", level_color(att.level)));
+    }
+    // Prefer Claude's state, else any producer's.
+    let state = anno
+        .states
+        .get("claude")
+        .or_else(|| anno.states.values().next())?;
+    if let Value::Str(s) = state {
+        return Some(match s.as_str() {
+            "waiting" | "needs-attention" => ("●", 3),
+            "working" => ("◐", 1),
+            "idle" => ("○", 1),
+            "error" => ("✗", 0),
+            _ => ("•", 2),
+        });
+    }
+    None
+}
+
 fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -1834,5 +2344,263 @@ mod tests {
     #[test]
     fn overlap_partial_is_true() {
         assert!(panes_overlap(&pane(0, 0, 100, 40), &pane(50, 20, 100, 40)));
+    }
+
+    // ---- pipe() annotation ops ----
+
+    fn pipe_msg(name: &str, args: &[(&str, &str)], payload: Option<&str>) -> PipeMessage {
+        PipeMessage {
+            source: PipeSource::Cli("test".into()),
+            name: name.into(),
+            payload: payload.map(String::from),
+            args: args
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            is_private: false,
+        }
+    }
+
+    fn anno(s: &State, session: &str, pane: u32) -> PaneAnno {
+        s.annotations
+            .get(&(session.to_string(), pane))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn pipe_set_writes_state() {
+        let mut s = State::default();
+        let r = s.pipe(pipe_msg(
+            "set",
+            &[("session", "a"), ("pane", "3"), ("key", "claude")],
+            Some("waiting"),
+        ));
+        assert!(r);
+        assert_eq!(
+            anno(&s, "a", 3).states.get("claude"),
+            Some(&Value::Str("waiting".into()))
+        );
+    }
+
+    #[test]
+    fn pipe_set_with_level_raises_attention() {
+        let mut s = State::default();
+        s.pipe(pipe_msg(
+            "set",
+            &[("session", "a"), ("pane", "3"), ("key", "claude"), ("level", "info")],
+            Some("waiting"),
+        ));
+        let a = anno(&s, "a", 3);
+        assert_eq!(a.states.get("claude"), Some(&Value::Str("waiting".into())));
+        assert_eq!(a.attention.as_ref().map(|x| x.level), Some(Level::Info));
+    }
+
+    #[test]
+    fn pipe_set_without_level_leaves_attention_unset() {
+        let mut s = State::default();
+        s.pipe(pipe_msg(
+            "set",
+            &[("session", "a"), ("pane", "3"), ("key", "claude")],
+            Some("working"),
+        ));
+        assert!(anno(&s, "a", 3).attention.is_none());
+    }
+
+    #[test]
+    fn pipe_missing_address_is_ignored() {
+        let mut s = State::default();
+        // No pane id.
+        assert!(!s.pipe(pipe_msg("set", &[("session", "a"), ("key", "k")], Some("v"))));
+        // Non-numeric pane id.
+        assert!(!s.pipe(pipe_msg(
+            "set",
+            &[("session", "a"), ("pane", "x"), ("key", "k")],
+            Some("v"),
+        )));
+        assert!(s.annotations.is_empty());
+    }
+
+    #[test]
+    fn pipe_append_builds_list_and_caps() {
+        let mut s = State::default();
+        for v in ["one", "two", "three"] {
+            s.pipe(pipe_msg(
+                "append",
+                &[("session", "a"), ("pane", "1"), ("key", "history"), ("max", "2")],
+                Some(v),
+            ));
+        }
+        assert_eq!(
+            anno(&s, "a", 1).states.get("history"),
+            Some(&Value::List(vec!["two".into(), "three".into()]))
+        );
+    }
+
+    #[test]
+    fn pipe_append_coerces_non_list() {
+        let mut s = State::default();
+        s.pipe(pipe_msg(
+            "set",
+            &[("session", "a"), ("pane", "1"), ("key", "k")],
+            Some("scalar"),
+        ));
+        s.pipe(pipe_msg(
+            "append",
+            &[("session", "a"), ("pane", "1"), ("key", "k")],
+            Some("item"),
+        ));
+        assert_eq!(
+            anno(&s, "a", 1).states.get("k"),
+            Some(&Value::List(vec!["item".into()]))
+        );
+    }
+
+    #[test]
+    fn pipe_incr_counts() {
+        let mut s = State::default();
+        s.pipe(pipe_msg("incr", &[("session", "a"), ("pane", "1"), ("key", "n")], None));
+        s.pipe(pipe_msg(
+            "incr",
+            &[("session", "a"), ("pane", "1"), ("key", "n"), ("by", "5")],
+            None,
+        ));
+        assert_eq!(anno(&s, "a", 1).states.get("n"), Some(&Value::Counter(6)));
+    }
+
+    #[test]
+    fn pipe_remove_item_then_key() {
+        let mut s = State::default();
+        for v in ["x", "y"] {
+            s.pipe(pipe_msg(
+                "append",
+                &[("session", "a"), ("pane", "1"), ("key", "l")],
+                Some(v),
+            ));
+        }
+        // Remove a single item.
+        s.pipe(pipe_msg(
+            "remove",
+            &[("session", "a"), ("pane", "1"), ("key", "l")],
+            Some("x"),
+        ));
+        assert_eq!(
+            anno(&s, "a", 1).states.get("l"),
+            Some(&Value::List(vec!["y".into()]))
+        );
+        // Remove with no value drops the key; the now-empty pane entry is GC'd.
+        s.pipe(pipe_msg("remove", &[("session", "a"), ("pane", "1"), ("key", "l")], None));
+        assert!(s.annotations.is_empty());
+    }
+
+    #[test]
+    fn pipe_clear_key_and_pane() {
+        let mut s = State::default();
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "1"), ("key", "a")], Some("1")));
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "1"), ("key", "b")], Some("2")));
+        s.pipe(pipe_msg("clear", &[("session", "a"), ("pane", "1"), ("key", "a")], None));
+        assert_eq!(anno(&s, "a", 1).states.len(), 1);
+        s.pipe(pipe_msg("clear", &[("session", "a"), ("pane", "1")], None));
+        assert!(s.annotations.is_empty());
+    }
+
+    #[test]
+    fn pipe_unknown_op_is_ignored() {
+        let mut s = State::default();
+        assert!(!s.pipe(pipe_msg(
+            "bogus",
+            &[("session", "a"), ("pane", "1"), ("key", "k")],
+            Some("v"),
+        )));
+    }
+
+    // ---- "seen" transitions ----
+
+    #[test]
+    fn mark_panes_seen_clears_attention_keeps_state() {
+        let mut s = State::default();
+        s.pipe(pipe_msg(
+            "set",
+            &[("session", "a"), ("pane", "1"), ("key", "claude"), ("level", "info")],
+            Some("waiting"),
+        ));
+        s.mark_panes_seen("a", &[1]);
+        let a = anno(&s, "a", 1);
+        assert!(a.attention.is_none(), "bell cleared");
+        assert_eq!(
+            a.states.get("claude"),
+            Some(&Value::Str("waiting".into())),
+            "state preserved"
+        );
+    }
+
+    #[test]
+    fn mark_panes_seen_gcs_attention_only_entry() {
+        let mut s = State::default();
+        // notify sets attention with no state.
+        s.pipe(pipe_msg(
+            "notify",
+            &[("session", "a"), ("pane", "1"), ("level", "warn")],
+            Some("look"),
+        ));
+        s.mark_panes_seen("a", &[1]);
+        assert!(s.annotations.is_empty(), "empty entry dropped");
+    }
+
+    #[test]
+    fn mark_panes_seen_only_named_panes() {
+        let mut s = State::default();
+        // Two panes in session "a" (different tabs), one in "b".
+        for (sess, pane) in [("a", "1"), ("a", "2"), ("b", "1")] {
+            s.pipe(pipe_msg(
+                "set",
+                &[("session", sess), ("pane", pane), ("key", "claude"), ("level", "info")],
+                Some("waiting"),
+            ));
+        }
+        // Land on the tab holding only pane 1.
+        s.mark_panes_seen("a", &[1]);
+        assert!(anno(&s, "a", 1).attention.is_none(), "seen pane cleared");
+        assert!(anno(&s, "a", 2).attention.is_some(), "other tab's pane untouched");
+        assert!(anno(&s, "b", 1).attention.is_some(), "other session untouched");
+    }
+
+    #[test]
+    fn clear_panes_removes_state_and_attention() {
+        let mut s = State::default();
+        // A pane with both state and a bell, plus a sibling that must survive.
+        s.pipe(pipe_msg(
+            "set",
+            &[("session", "a"), ("pane", "1"), ("key", "claude"), ("level", "info")],
+            Some("waiting"),
+        ));
+        s.pipe(pipe_msg("append", &[("session", "a"), ("pane", "1"), ("key", "h")], Some("x")));
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "2"), ("key", "claude")], Some("working")));
+
+        assert!(s.clear_panes("a", &[1]), "something removed");
+        assert!(
+            s.annotations.get(&("a".into(), 1)).is_none(),
+            "pane 1 fully gone (no glyph)"
+        );
+        assert!(anno(&s, "a", 2).states.contains_key("claude"), "pane 2 untouched");
+        // Nothing to remove → no change.
+        assert!(!s.clear_panes("a", &[1]));
+    }
+
+    #[test]
+    fn session_attention_reports_worst_level() {
+        let mut s = State::default();
+        s.pipe(pipe_msg(
+            "notify",
+            &[("session", "a"), ("pane", "1"), ("level", "info")],
+            Some(""),
+        ));
+        s.pipe(pipe_msg(
+            "notify",
+            &[("session", "a"), ("pane", "2"), ("level", "error")],
+            Some(""),
+        ));
+        assert_eq!(s.session_attention("a"), Some(Level::Error));
+        assert_eq!(s.session_attention("nope"), None);
     }
 }

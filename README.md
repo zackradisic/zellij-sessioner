@@ -126,6 +126,10 @@ cargo test --target $(rustc -vV | sed -n 's/host: //p')
 | `↑` / `k` | Move selection up |
 | `↓` / `j` | Move selection down |
 | `/` | Search / filter sessions |
+| `a` | Toggle "only sessions waiting on me" (see [Pane annotation bus](#pane-annotation-bus)) |
+| `l` | Drill deeper in place: session → tabs → individual panes; `j`/`k` moves at the current depth |
+| `h` | Back out one level (pane → tab → session) |
+| `m` | Mark the current selection done — clears its annotations entirely, scoped to depth (pane / tab / session) |
 | `p` | Toggle a live color preview of the selected session's focused pane |
 | `Enter` | Switch to selected session / start new session |
 | `r` | Rename the attached session (other sessions can't be renamed via the plugin API) |
@@ -158,6 +162,100 @@ list with pane manifests. For each session it shows:
 - **Pane titles** indented underneath (plugin panes excluded)
 
 Dead (resurrectable) sessions appear at the bottom with their age.
+
+## Pane annotation bus
+
+Any external process can **annotate a pane** — flag it as needing attention or
+attach state to it — by piping a message to the plugin. The session list then
+shows a badge next to the pane and an aggregate bell next to its session, so you
+can see at a glance which panes want you (and filter to just those with `a`).
+
+The motivating case: surfacing which Claude Code sessions are idle waiting on
+your input. But the bus is generic — a build, a test watcher, or any script can
+use it.
+
+### Concepts
+
+- **State** — a durable, producer-namespaced label (`claude=waiting`,
+  `tests=failing`). Overwritten by the next event from that producer. Stored as a
+  typed value (string / list / counter), so producers can keep more than strings.
+- **Attention** — a transient "look at me" bell, raised by an event and cleared
+  when *you* see the pane. State persists when attention clears, so a pane can
+  stay `waiting` in the list without nagging.
+
+A pane is marked **seen** (its bell cleared) when you either attach to its
+session through the sessioner or manually focus the pane in the attached session.
+
+### `pane-notify`
+
+[`scripts/pane-notify`](scripts/pane-notify) wraps `zellij pipe`, filling in the
+session/pane from the environment. It sends an **operation**, not a whole value —
+the plugin (the single owner of the state) applies it, so appends and counters
+can't race:
+
+```sh
+pane-notify set    key=claude level=info -- waiting   # set state + ring the bell
+pane-notify set    key=claude            -- working   # update state, no bell
+pane-notify append key=history max=50    -- "ran tests"  # push onto a capped list
+pane-notify incr   key=builds                          # bump a counter
+pane-notify notify level=warn            -- "needs input"  # bell only
+pane-notify clear  key=claude                          # drop a key (or the whole pane)
+```
+
+| op | effect |
+|----|--------|
+| `set key=<k> [level=…] -- <v>` | `states[k] = <v>`; with `level`, also rings the bell |
+| `append key=<k> [max=<n>] -- <item>` | push onto a list, trimmed to the last `n` |
+| `remove key=<k> [-- <item>]` | drop one list item, or the whole key |
+| `incr key=<k> [by=<n>]` | bump a counter (default +1) |
+| `notify [level=…] -- <label>` | ring the attention bell only |
+| `clear [key=<k>]` | drop a key, or the whole pane's annotations |
+
+Free-form text goes after `--` (so it may contain commas/spaces); structured
+fields go as `key=value` args.
+
+### Claude Code hooks
+
+Wire `pane-notify` into `~/.claude/settings.json` so Claude sessions surface
+automatically:
+
+```jsonc
+"SessionStart":     [{ "matcher": "", "hooks": [{ "type": "command", "command": "/path/to/pane-notify set key=claude -- idle" }]}],
+"UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": "/path/to/pane-notify set key=claude -- working" }]}],
+"Stop":             [{ "matcher": "", "hooks": [{ "type": "command", "command": "/path/to/pane-notify set key=claude level=info -- waiting" }]}],
+"Notification":     [{ "matcher": "", "hooks": [{ "type": "command", "command": "/path/to/pane-notify set key=claude level=warn -- waiting" }]}],
+"SessionEnd":       [{ "matcher": "", "hooks": [{ "type": "command", "command": "/path/to/pane-notify clear key=claude" }]}]
+```
+
+The badge glyphs the plugin renders for the `claude` state: `○` idle, `◐`
+working, `●` waiting (yellow), `✗` error — overridden by a bell-colored `●`
+while attention is unacknowledged.
+
+### Routing
+
+A message must be **targeted at the plugin's URL** (`zellij pipe --plugin <url>`):
+broadcasting (no `--plugin`) does *not* reach the plugin in practice. `pane-notify`
+resolves the URL in this order:
+
+1. `$SESSIONER_PLUGIN`, if set (e.g. `file:/abs/path/to/zellij-sessioner.wasm`).
+2. Otherwise, the `LaunchOrFocusPlugin "...sessioner....wasm"` entry in your zellij
+   config (`$ZELLIJ_CONFIG_FILE`, else `$XDG_CONFIG_HOME/zellij/config.kdl`, else
+   `~/.config/zellij/config.kdl`) — so your **keybind URL is the single source of
+   truth** and you don't have to duplicate it.
+
+The URL must match the one your keybind uses, or `--plugin` launches a *separate*
+instance (zellij keys plugins by URL + configuration). If no URL can be resolved,
+`pane-notify` falls back to a (best-effort) broadcast; outside zellij it's a no-op.
+
+### Keeping it resident
+
+The annotation store lives only in the running plugin's memory (its lifetime is
+the zellij session's lifetime — by design, since closing zellij also kills every
+pane being tracked). For annotations to accumulate while you're away from the
+sessioner, the plugin must be **running** when the events arrive. Targeting by URL
+helps here: `pane-notify` launches the plugin if it isn't already running. Note a
+freshly launched instance starts empty, so loading it once per session (via your
+keybind or layout) keeps state continuous.
 
 ## Preview
 
