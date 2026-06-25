@@ -56,13 +56,14 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
-# `zellij pipe` blocks the caller until a receiving plugin unblocks the pipe
-# (the sessioner does so the instant it handles the message). But if no sessioner
-# is listening, it would block forever — so this MUST be fire-and-forget:
-#   - cap the wait with timeout(1) when available (kills a stuck pipe), and
-#   - background it so the calling hook returns immediately regardless.
-# The value is the positional PAYLOAD (after `--`), never stdin: a piped stdin
-# makes `zellij pipe` treat the input as a streaming pipe and block.
+# `zellij pipe` is a client that must stay alive for the full round-trip (send ->
+# plugin handles + unblocks -> return), so it is run in the FOREGROUND — a
+# backgrounded pipe gets torn down before it delivers when this script exits.
+# It returns in milliseconds because `--plugin` always has a receiver that
+# unblocks immediately; the timeout below is just a safety net (and the pipe is
+# blocking only without `--plugin`, which we always pass). The value is the
+# positional PAYLOAD (after `--`), never stdin: a piped stdin makes `zellij pipe`
+# treat the input as a streaming pipe and block.
 TIMEOUT=""
 if command -v timeout >/dev/null 2>&1; then
     TIMEOUT="timeout 2"
@@ -97,4 +98,4 @@ else
 fi
 
 # shellcheck disable=SC2086
-$TIMEOUT zellij "$@" </dev/null >/dev/null 2>&1 &
+$TIMEOUT zellij "$@" </dev/null >/dev/null 2>&1 || true

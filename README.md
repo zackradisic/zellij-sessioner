@@ -211,6 +211,14 @@ pane-notify clear  key=claude                          # drop a key (or the whol
 | `notify [level=…] -- <label>` | ring the attention bell only |
 | `clear [key=<k>]` | drop a key, or the whole pane's annotations |
 
+**Row tint:** there's no special color op — a pane is tinted by setting the
+reserved `color` state key to a hex value with the ordinary `set` op:
+`set key=color -- d97757` (no `#` — it's a shell comment). Clear it with
+`clear key=color`; `m` (mark done) clears it along with the rest of the pane's
+state. The `Text` UI is **theme-palette only (no RGB)**, so the tint uses a theme
+palette level (`COLORED_PANE_LEVEL`, currently `3`) — the stored hex is parsed to
+decide *whether* to tint, not for an exact color.
+
 Free-form text goes after `--` (so it may contain commas/spaces); structured
 fields go as `key=value` args.
 
@@ -230,6 +238,14 @@ automatically:
 The badge glyphs the plugin renders for the `claude` state: `○` idle, `◐`
 working, `●` waiting (yellow), `✗` error — overridden by a bell-colored `●`
 while attention is unacknowledged.
+
+To tint Claude panes (orange), set the `color` key on the activity hooks and
+clear it on `SessionEnd` (alongside the commands above):
+
+```jsonc
+"SessionStart": ... "/path/to/pane-notify set key=color -- d97757"   // bare hex — no '#' (shell comment)
+"SessionEnd":   ... "/path/to/pane-notify clear key=color"
+```
 
 ### Routing
 

@@ -94,31 +94,53 @@ enum Level {
     Error,
 }
 
-/// A transient "look at me" bell raised by a producer event. Unlike state
-/// (which is overwritten by the next event), attention is cleared by the *user*
-/// seeing the pane — see `mark_session_seen` / the `PaneUpdate` handler.
-#[derive(Clone, Debug, PartialEq)]
-struct Attention {
-    level: Level,
-    label: String,
-    producer: String,
-}
-
-/// Everything annotated onto a single pane.
-#[derive(Clone, Default, Debug, PartialEq)]
-struct PaneAnno {
-    /// Producer-namespaced state values (e.g. `"claude" -> Str("waiting")`).
-    states: BTreeMap<String, Value>,
-    /// The attention bell; `None` once acknowledged (seen).
-    attention: Option<Attention>,
-}
-
-impl PaneAnno {
-    /// True once there's nothing left to display, so the entry can be dropped.
-    fn is_empty(&self) -> bool {
-        self.states.is_empty() && self.attention.is_none()
+impl Level {
+    /// Parse a bell level string (`info`/`warn`/`error`).
+    fn parse(s: &str) -> Option<Level> {
+        match s {
+            "info" => Some(Level::Info),
+            "warn" => Some(Level::Warn),
+            "error" => Some(Level::Error),
+            _ => None,
+        }
     }
 }
+
+/// A pane's annotations: a flat key -> Value store (Redis-style). There are no
+/// special fields — everything a producer attaches is just a key. Two keys are
+/// *reserved* because the renderer interprets them: `color` (a hex row tint, e.g.
+/// `d97757`) and `bell` (an attention level `info`/`warn`/`error`, cleared when
+/// the user sees the pane). Any other key is producer state (e.g.
+/// `claude:state` -> `waiting`) and drives the pane's badge glyph.
+type PaneAnno = BTreeMap<String, Value>;
+
+/// Reserved annotation key: the pane's row tint (a hex string).
+const KEY_COLOR: &str = "color";
+/// Reserved annotation key: the attention bell's level string.
+const KEY_BELL: &str = "bell";
+
+/// The string value of a key, if it's a `Str`.
+fn anno_str<'a>(anno: &'a PaneAnno, key: &str) -> Option<&'a str> {
+    match anno.get(key) {
+        Some(Value::Str(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// The pane's attention bell level, if any (reads the reserved `bell` key).
+fn anno_bell(anno: &PaneAnno) -> Option<Level> {
+    anno_str(anno, KEY_BELL).and_then(Level::parse)
+}
+
+/// The pane's row tint, if any (reads the reserved `color` key).
+fn anno_color(anno: &PaneAnno) -> Option<(u8, u8, u8)> {
+    anno_str(anno, KEY_COLOR).and_then(parse_hex_color)
+}
+
+/// Theme palette color level used to tint a pane that carries a producer color
+/// (e.g. a Claude pane). The `Text` API is theme-only — no RGB — so a color is
+/// rendered as one of the theme's palette levels rather than an exact hex.
+const COLORED_PANE_LEVEL: usize = 3;
 
 /// One row group in the (possibly filtered) list. Selection, activation and
 /// rendering all index into the same `Vec<Entry>` so they can never disagree.
@@ -395,29 +417,21 @@ impl ZellijPlugin for State {
             .payload
             .clone()
             .or_else(|| msg.args.get("value").cloned());
-        let producer = msg
-            .args
-            .get("producer")
-            .cloned()
-            .unwrap_or_else(|| "anon".to_string());
-        let level = msg.args.get("level").map(|l| match l.as_str() {
-            "error" => Level::Error,
-            "warn" => Level::Warn,
-            _ => Level::Info,
-        });
 
         let map_key = (session, pane);
 
+        // Every op works on the pane's flat key->Value store. Rendering meaning
+        // (tint, bell, badge) is decided by the key, not a bespoke field — set
+        // the bell with `set key=bell -- info`, the tint with `set key=color`.
         match msg.name.as_str() {
             "set" => {
-                let (Some(k), Some(v)) = (key, value.clone()) else {
+                let (Some(k), Some(v)) = (key, value) else {
                     return false;
                 };
-                let anno = self.annotations.entry(map_key).or_default();
-                anno.states.insert(k, Value::Str(v.clone()));
-                if let Some(level) = level {
-                    anno.attention = Some(Attention { level, label: v, producer });
-                }
+                self.annotations
+                    .entry(map_key)
+                    .or_default()
+                    .insert(k, Value::Str(v));
             }
             "append" => {
                 let (Some(k), Some(v)) = (key, value) else {
@@ -425,7 +439,7 @@ impl ZellijPlugin for State {
                 };
                 let max = msg.args.get("max").and_then(|m| m.parse::<usize>().ok());
                 let anno = self.annotations.entry(map_key).or_default();
-                let list = match anno.states.entry(k).or_insert_with(|| Value::List(Vec::new())) {
+                let list = match anno.entry(k).or_insert_with(|| Value::List(Vec::new())) {
                     Value::List(l) => l,
                     // Coerce a mismatched value into a fresh list.
                     slot => {
@@ -445,12 +459,12 @@ impl ZellijPlugin for State {
             "remove" => {
                 let Some(k) = key else { return false };
                 if let Some(anno) = self.annotations.get_mut(&map_key) {
-                    match (value, anno.states.get_mut(&k)) {
+                    match (value, anno.get_mut(&k)) {
                         // Remove a single item from a list.
                         (Some(v), Some(Value::List(l))) => l.retain(|x| x != &v),
                         // No value, or a non-list value: drop the whole key.
                         _ => {
-                            anno.states.remove(&k);
+                            anno.remove(&k);
                         }
                     }
                     if anno.is_empty() {
@@ -466,25 +480,17 @@ impl ZellijPlugin for State {
                     .and_then(|b| b.parse::<i64>().ok())
                     .unwrap_or(1);
                 let anno = self.annotations.entry(map_key).or_default();
-                match anno.states.entry(k).or_insert(Value::Counter(0)) {
+                match anno.entry(k).or_insert(Value::Counter(0)) {
                     Value::Counter(n) => *n += by,
                     slot => *slot = Value::Counter(by),
                 }
-            }
-            "notify" => {
-                let anno = self.annotations.entry(map_key).or_default();
-                anno.attention = Some(Attention {
-                    level: level.unwrap_or(Level::Info),
-                    label: value.unwrap_or_default(),
-                    producer,
-                });
             }
             "clear" => {
                 match key {
                     // Clear one key; drop the pane entry if nothing's left.
                     Some(k) => {
                         if let Some(anno) = self.annotations.get_mut(&map_key) {
-                            anno.states.remove(&k);
+                            anno.remove(&k);
                             if anno.is_empty() {
                                 self.annotations.remove(&map_key);
                             }
@@ -611,7 +617,7 @@ impl State {
         self.annotations
             .iter()
             .filter(|((s, _), _)| s == name)
-            .filter_map(|(_, a)| a.attention.as_ref().map(|att| att.level))
+            .filter_map(|(_, a)| anno_bell(a))
             .max()
     }
 
@@ -649,10 +655,10 @@ impl State {
     /// list and the per-tab view so the badge layout lives in one place.
     fn pane_line(&self, session: &str, id: u32, title: &str, indent: usize, selected: bool) -> Text {
         let pad = " ".repeat(indent);
-        let badge = self
-            .annotations
-            .get(&(session.to_string(), id))
-            .and_then(anno_badge);
+        let anno = self.annotations.get(&(session.to_string(), id));
+        let badge = anno.and_then(anno_badge);
+        // A pane carrying a valid `color` key gets its title tinted.
+        let has_color = anno.and_then(anno_color).is_some();
         let (text, title_start, glyph) = match badge {
             Some((g, color)) => {
                 let g_len = g.chars().count();
@@ -664,7 +670,14 @@ impl State {
         if let Some((g_len, color)) = glyph {
             item = item.color_range(color, indent..indent + g_len);
         }
-        item = item.color_range(1, title_start..);
+        // Tint the title with a theme palette level (the Text API has no RGB).
+        // The selected row's highlight wins, so leave it dim there.
+        let title_level = if !selected && has_color {
+            COLORED_PANE_LEVEL
+        } else {
+            1
+        };
+        item = item.color_range(title_level, title_start..);
         if selected {
             item = item.selected();
         }
@@ -1146,11 +1159,11 @@ impl State {
                 let cleared = self
                     .annotations
                     .get_mut(&k)
-                    .map(|a| a.attention.take().is_some())
+                    .map(|a| a.remove(KEY_BELL).is_some())
                     .unwrap_or(false);
                 if cleared {
                     changed = true;
-                    if self.annotations.get(&k).map(PaneAnno::is_empty).unwrap_or(false) {
+                    if self.annotations.get(&k).is_some_and(|a| a.is_empty()) {
                         self.annotations.remove(&k);
                     }
                 }
@@ -1178,23 +1191,22 @@ impl State {
             .unwrap_or_default()
     }
 
-    /// Jump "seen": acknowledge the attention bell on the given panes of a
-    /// session (state values are preserved), dropping any entry left empty.
+    /// "Seen": drop the attention bell (`bell` key) on the given panes; all other
+    /// keys (state, color) are preserved. Removes an entry left empty.
     fn mark_panes_seen(&mut self, session: &str, ids: &[u32]) {
         for &id in ids {
             let k = (session.to_string(), id);
             if let Some(anno) = self.annotations.get_mut(&k) {
-                anno.attention = None;
-            }
-            if self.annotations.get(&k).map(PaneAnno::is_empty).unwrap_or(false) {
-                self.annotations.remove(&k);
+                anno.remove(KEY_BELL);
+                if anno.is_empty() {
+                    self.annotations.remove(&k);
+                }
             }
         }
     }
 
-    /// Remove every annotation (state *and* attention — any glyph) on the given
-    /// panes. Unlike `mark_panes_seen`, which only silences the bell, this fully
-    /// clears them. Returns whether anything was removed.
+    /// "Mark done" (`m`): drop the whole annotation entry for the given panes —
+    /// every key, color included. Returns whether anything was removed.
     fn clear_panes(&mut self, session: &str, ids: &[u32]) -> bool {
         let mut changed = false;
         for &id in ids {
@@ -1963,6 +1975,19 @@ fn keyhints(pairs: &[(&str, &str)]) -> Text {
     text
 }
 
+/// Parse a `#rrggbb` (or `rrggbb`) hex string into RGB. Returns `None` for empty
+/// or malformed input (so an empty payload reads as "clear").
+fn parse_hex_color(s: &str) -> Option<(u8, u8, u8)> {
+    let h = s.strip_prefix('#').unwrap_or(s);
+    if h.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
 /// Palette color index (0–3, theme-relative) for an attention level.
 fn level_color(level: Level) -> usize {
     match level {
@@ -1977,14 +2002,16 @@ fn level_color(level: Level) -> usize {
 /// underlying state glyph shows through (so a seen `waiting` still reads as
 /// waiting, just without the bell color).
 fn anno_badge(anno: &PaneAnno) -> Option<(&'static str, usize)> {
-    if let Some(att) = &anno.attention {
-        return Some(("●", level_color(att.level)));
+    // The bell takes visual precedence; once seen, the state glyph shows through.
+    if let Some(level) = anno_bell(anno) {
+        return Some(("●", level_color(level)));
     }
-    // Prefer Claude's state, else any producer's.
+    // Otherwise derive the glyph from the first state key's value — skipping the
+    // reserved `color`/`bell` keys, which aren't displayable statuses.
     let state = anno
-        .states
-        .get("claude")
-        .or_else(|| anno.states.values().next())?;
+        .iter()
+        .find(|(k, _)| k.as_str() != KEY_COLOR && k.as_str() != KEY_BELL)
+        .map(|(_, v)| v)?;
     if let Value::Str(s) = state {
         return Some(match s.as_str() {
             "waiting" | "needs-attention" => ("●", 3),
@@ -2378,33 +2405,20 @@ mod tests {
         ));
         assert!(r);
         assert_eq!(
-            anno(&s, "a", 3).states.get("claude"),
+            anno(&s, "a", 3).get("claude"),
             Some(&Value::Str("waiting".into()))
         );
     }
 
     #[test]
-    fn pipe_set_with_level_raises_attention() {
+    fn bell_is_just_the_reserved_key() {
         let mut s = State::default();
-        s.pipe(pipe_msg(
-            "set",
-            &[("session", "a"), ("pane", "3"), ("key", "claude"), ("level", "info")],
-            Some("waiting"),
-        ));
-        let a = anno(&s, "a", 3);
-        assert_eq!(a.states.get("claude"), Some(&Value::Str("waiting".into())));
-        assert_eq!(a.attention.as_ref().map(|x| x.level), Some(Level::Info));
-    }
-
-    #[test]
-    fn pipe_set_without_level_leaves_attention_unset() {
-        let mut s = State::default();
-        s.pipe(pipe_msg(
-            "set",
-            &[("session", "a"), ("pane", "3"), ("key", "claude")],
-            Some("working"),
-        ));
-        assert!(anno(&s, "a", 3).attention.is_none());
+        // The bell is set with the ordinary `set` op on the reserved `bell` key.
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "3"), ("key", "bell")], Some("info")));
+        assert_eq!(anno_bell(&anno(&s, "a", 3)), Some(Level::Info));
+        // A plain state key never raises a bell.
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "4"), ("key", "claude:state")], Some("working")));
+        assert_eq!(anno_bell(&anno(&s, "a", 4)), None);
     }
 
     #[test]
@@ -2432,7 +2446,7 @@ mod tests {
             ));
         }
         assert_eq!(
-            anno(&s, "a", 1).states.get("history"),
+            anno(&s, "a", 1).get("history"),
             Some(&Value::List(vec!["two".into(), "three".into()]))
         );
     }
@@ -2451,7 +2465,7 @@ mod tests {
             Some("item"),
         ));
         assert_eq!(
-            anno(&s, "a", 1).states.get("k"),
+            anno(&s, "a", 1).get("k"),
             Some(&Value::List(vec!["item".into()]))
         );
     }
@@ -2465,7 +2479,7 @@ mod tests {
             &[("session", "a"), ("pane", "1"), ("key", "n"), ("by", "5")],
             None,
         ));
-        assert_eq!(anno(&s, "a", 1).states.get("n"), Some(&Value::Counter(6)));
+        assert_eq!(anno(&s, "a", 1).get("n"), Some(&Value::Counter(6)));
     }
 
     #[test]
@@ -2485,7 +2499,7 @@ mod tests {
             Some("x"),
         ));
         assert_eq!(
-            anno(&s, "a", 1).states.get("l"),
+            anno(&s, "a", 1).get("l"),
             Some(&Value::List(vec!["y".into()]))
         );
         // Remove with no value drops the key; the now-empty pane entry is GC'd.
@@ -2499,7 +2513,7 @@ mod tests {
         s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "1"), ("key", "a")], Some("1")));
         s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "1"), ("key", "b")], Some("2")));
         s.pipe(pipe_msg("clear", &[("session", "a"), ("pane", "1"), ("key", "a")], None));
-        assert_eq!(anno(&s, "a", 1).states.len(), 1);
+        assert_eq!(anno(&s, "a", 1).len(), 1);
         s.pipe(pipe_msg("clear", &[("session", "a"), ("pane", "1")], None));
         assert!(s.annotations.is_empty());
     }
@@ -2514,92 +2528,105 @@ mod tests {
         )));
     }
 
-    // ---- "seen" transitions ----
+    // ---- color (just a `color` state value via the generic ops) ----
 
     #[test]
-    fn mark_panes_seen_clears_attention_keeps_state() {
+    fn color_is_a_state_set_and_cleared_generically() {
         let mut s = State::default();
-        s.pipe(pipe_msg(
-            "set",
-            &[("session", "a"), ("pane", "1"), ("key", "claude"), ("level", "info")],
-            Some("waiting"),
-        ));
+        // Set via the generic `set` op — no bespoke color op.
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "1"), ("key", "color")], Some("d97757")));
+        assert_eq!(
+            anno(&s, "a", 1).get("color"),
+            Some(&Value::Str("d97757".into()))
+        );
+        // Cleared via the generic `clear` op.
+        s.pipe(pipe_msg("clear", &[("session", "a"), ("pane", "1"), ("key", "color")], None));
+        assert!(s.annotations.is_empty());
+    }
+
+    #[test]
+    fn parse_hex_color_cases() {
+        assert_eq!(parse_hex_color("#d97757"), Some((217, 119, 87)));
+        assert_eq!(parse_hex_color("d97757"), Some((217, 119, 87)));
+        assert_eq!(parse_hex_color("#fff"), None);
+        assert_eq!(parse_hex_color(""), None);
+        assert_eq!(parse_hex_color("#gggggg"), None);
+    }
+
+    #[test]
+    fn mark_done_clears_color_state_too() {
+        let mut s = State::default();
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "1"), ("key", "claude")], Some("waiting")));
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "1"), ("key", "color")], Some("d97757")));
+        // `m` clears all of the pane's state, color included.
+        assert!(s.clear_panes("a", &[1]));
+        assert!(s.annotations.is_empty(), "everything cleared, entry dropped");
+    }
+
+    // ---- "seen" transitions ----
+
+    // Set the bell on a pane via the reserved `bell` key.
+    fn set_bell(s: &mut State, session: &str, pane: &str, level: &str) {
+        s.pipe(pipe_msg("set", &[("session", session), ("pane", pane), ("key", "bell")], Some(level)));
+    }
+
+    #[test]
+    fn seen_drops_bell_keeps_state() {
+        let mut s = State::default();
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "1"), ("key", "claude:state")], Some("waiting")));
+        set_bell(&mut s, "a", "1", "info");
         s.mark_panes_seen("a", &[1]);
         let a = anno(&s, "a", 1);
-        assert!(a.attention.is_none(), "bell cleared");
+        assert!(anno_bell(&a).is_none(), "bell cleared");
         assert_eq!(
-            a.states.get("claude"),
+            a.get("claude:state"),
             Some(&Value::Str("waiting".into())),
             "state preserved"
         );
     }
 
     #[test]
-    fn mark_panes_seen_gcs_attention_only_entry() {
+    fn seen_gcs_bell_only_entry() {
         let mut s = State::default();
-        // notify sets attention with no state.
-        s.pipe(pipe_msg(
-            "notify",
-            &[("session", "a"), ("pane", "1"), ("level", "warn")],
-            Some("look"),
-        ));
+        set_bell(&mut s, "a", "1", "warn"); // bell with no other key
         s.mark_panes_seen("a", &[1]);
         assert!(s.annotations.is_empty(), "empty entry dropped");
     }
 
     #[test]
-    fn mark_panes_seen_only_named_panes() {
+    fn seen_only_named_panes() {
         let mut s = State::default();
-        // Two panes in session "a" (different tabs), one in "b".
-        for (sess, pane) in [("a", "1"), ("a", "2"), ("b", "1")] {
-            s.pipe(pipe_msg(
-                "set",
-                &[("session", sess), ("pane", pane), ("key", "claude"), ("level", "info")],
-                Some("waiting"),
-            ));
+        for pane in ["1", "2"] {
+            set_bell(&mut s, "a", pane, "info");
         }
+        set_bell(&mut s, "b", "1", "info");
         // Land on the tab holding only pane 1.
         s.mark_panes_seen("a", &[1]);
-        assert!(anno(&s, "a", 1).attention.is_none(), "seen pane cleared");
-        assert!(anno(&s, "a", 2).attention.is_some(), "other tab's pane untouched");
-        assert!(anno(&s, "b", 1).attention.is_some(), "other session untouched");
+        assert!(anno_bell(&anno(&s, "a", 1)).is_none(), "seen pane cleared");
+        assert!(anno_bell(&anno(&s, "a", 2)).is_some(), "other tab's pane untouched");
+        assert!(anno_bell(&anno(&s, "b", 1)).is_some(), "other session untouched");
     }
 
     #[test]
-    fn clear_panes_removes_state_and_attention() {
+    fn mark_done_drops_whole_pane() {
         let mut s = State::default();
-        // A pane with both state and a bell, plus a sibling that must survive.
-        s.pipe(pipe_msg(
-            "set",
-            &[("session", "a"), ("pane", "1"), ("key", "claude"), ("level", "info")],
-            Some("waiting"),
-        ));
-        s.pipe(pipe_msg("append", &[("session", "a"), ("pane", "1"), ("key", "h")], Some("x")));
-        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "2"), ("key", "claude")], Some("working")));
+        // A pane with state + bell + color, plus a sibling that must survive.
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "1"), ("key", "claude:state")], Some("waiting")));
+        set_bell(&mut s, "a", "1", "info");
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "1"), ("key", "color")], Some("d97757")));
+        s.pipe(pipe_msg("set", &[("session", "a"), ("pane", "2"), ("key", "claude:state")], Some("working")));
 
         assert!(s.clear_panes("a", &[1]), "something removed");
-        assert!(
-            s.annotations.get(&("a".into(), 1)).is_none(),
-            "pane 1 fully gone (no glyph)"
-        );
-        assert!(anno(&s, "a", 2).states.contains_key("claude"), "pane 2 untouched");
-        // Nothing to remove → no change.
-        assert!(!s.clear_panes("a", &[1]));
+        assert!(s.annotations.get(&("a".into(), 1)).is_none(), "pane 1 fully gone");
+        assert!(anno(&s, "a", 2).contains_key("claude:state"), "pane 2 untouched");
+        assert!(!s.clear_panes("a", &[1]), "nothing left to remove");
     }
 
     #[test]
-    fn session_attention_reports_worst_level() {
+    fn session_attention_reports_worst_bell() {
         let mut s = State::default();
-        s.pipe(pipe_msg(
-            "notify",
-            &[("session", "a"), ("pane", "1"), ("level", "info")],
-            Some(""),
-        ));
-        s.pipe(pipe_msg(
-            "notify",
-            &[("session", "a"), ("pane", "2"), ("level", "error")],
-            Some(""),
-        ));
+        set_bell(&mut s, "a", "1", "info");
+        set_bell(&mut s, "a", "2", "error");
         assert_eq!(s.session_attention("a"), Some(Level::Error));
         assert_eq!(s.session_attention("nope"), None);
     }
