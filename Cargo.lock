@@ -2788,7 +2788,7 @@ dependencies = [
 
 [[package]]
 name = "zellij-sessioner"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "zellij-tile",
 ]

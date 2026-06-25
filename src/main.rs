@@ -670,13 +670,10 @@ impl State {
         if let Some((g_len, color)) = glyph {
             item = item.color_range(color, indent..indent + g_len);
         }
-        // Tint the title with a theme palette level (the Text API has no RGB).
-        // The selected row's highlight wins, so leave it dim there.
-        let title_level = if !selected && has_color {
-            COLORED_PANE_LEVEL
-        } else {
-            1
-        };
+        // Tint the title with a theme palette level (the Text API has no RGB),
+        // even when the row is selected — the tint reads as a colored foreground
+        // over the selection highlight rather than being dropped for it.
+        let title_level = if has_color { COLORED_PANE_LEVEL } else { 1 };
         item = item.color_range(title_level, title_start..);
         if selected {
             item = item.selected();
